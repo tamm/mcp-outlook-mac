@@ -1,0 +1,16 @@
+{
+  "name": "outlook-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Microsoft Outlook on macOS",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": ["mcp", "outlook", "email"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.1"
+  }
+}

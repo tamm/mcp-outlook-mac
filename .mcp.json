@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "outlook-mcp": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "./index.js"
+      ],
+      "env": {}
+    }
+  }
+}
