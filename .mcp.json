@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "outlook-mcp": {
+    "mcp-outlook-mac": {
       "type": "stdio",
       "command": "node",
       "args": [
