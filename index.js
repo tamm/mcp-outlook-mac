@@ -583,7 +583,7 @@ function handleSearchEmails(args) {
   }
 
   // Unread filter
-  const unreadClause = args?.unread_only ? "AND m.Message_IsRead = 0" : "";
+  const unreadClause = args?.unread_only ? "AND m.Message_ReadFlag = 0" : "";
 
   // Date filters (Outlook stores Message_TimeReceived as Unix timestamp)
   let dateClause = "";
@@ -599,7 +599,7 @@ function handleSearchEmails(args) {
   const emails = runSqlite(`
     SELECT m.Record_RecordID, m.Message_NormalizedSubject, m.Message_SenderList,
            m.Message_TimeReceived, m.Message_HasAttachment,
-           m.Message_IsRead, m.Message_IsFlagged,
+           m.Message_ReadFlag, m.Record_FlagStatus,
            f.Folder_Name,
            COALESCE(ae.Account_Name, am.Account_Name, 'Local') AS AccountName
     FROM Mail m
@@ -625,8 +625,8 @@ function handleSearchEmails(args) {
       : "";
     const from = msg.Message_SenderList || "";
     const account = msg.AccountName ? `${msg.AccountName}/` : "";
-    const unread = msg.Message_IsRead ? " " : "●";
-    const flagged = msg.Message_IsFlagged ? "⚑ " : "";
+    const unread = msg.Message_ReadFlag ? " " : "●";
+    const flagged = msg.Record_FlagStatus ? "⚑ " : "";
     const attach = msg.Message_HasAttachment ? " 📎" : "";
     return `ID:${msg.Record_RecordID} | ${unread} ${flagged}${date} | ${from} | ${msg.Message_NormalizedSubject || "(no subject)"}${attach} [${account}${msg.Folder_Name}]`;
   });
@@ -662,7 +662,7 @@ ${findMessageScript(emailId)}
         set msgContent to plain text content of targetMsg
     end try
     set isRead to is read of targetMsg
-    set isFlagged to is flagged of targetMsg
+    set flagStatus to todo flag of targetMsg
 
     set toList to ""
     try
@@ -697,7 +697,7 @@ ${findMessageScript(emailId)}
     set readFlag to "false"
     if isRead then set readFlag to "true"
     set flaggedFlag to "false"
-    if isFlagged then set flaggedFlag to "true"
+    if flagStatus is not not flagged then set flaggedFlag to "true"
 
     set output to "Subject: " & msgSubject & "\\n"
     set output to output & "From: " & msgSender & " <" & msgSenderEmail & ">\\n"
@@ -1108,4 +1108,18 @@ async function main() {
   console.error("Outlook MCP server running on stdio");
 }
 
-main().catch(console.error);
+const isDirectRun = process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/^\//, ""));
+if (isDirectRun) {
+  main().catch(console.error);
+}
+
+export {
+  extractEmail,
+  parseRecipients,
+  recipientLines,
+  escapeForAppleScript,
+  stripSignature,
+  stripQuotedReplies,
+  cleanBody,
+  markdownToHtml,
+};
