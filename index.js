@@ -252,6 +252,27 @@ function escapeForAppleScript(str) {
   return str.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\r/g, "\\r");
 }
 
+function extractEmail(raw) {
+  const s = raw.trim();
+  if (!s) return "";
+  // "Display Name <email@example.com>" → email@example.com
+  const angleMatch = s.match(/<([^>]+)>/);
+  if (angleMatch) return angleMatch[1].trim();
+  return s;
+}
+
+function parseRecipients(input) {
+  if (!input) return [];
+  if (Array.isArray(input)) return input.map(extractEmail).filter(Boolean);
+  return input.split(/[,;]/).map(extractEmail).filter(Boolean);
+}
+
+function recipientLines(addresses, type, msgVar) {
+  return addresses.map(addr =>
+    `make new ${type} recipient at ${msgVar} with properties {email address:{address:"${escapeForAppleScript(addr)}"}}`
+  ).join("\n    ");
+}
+
 // --- Resolve folder IDs for queries ---
 
 function resolveFolder(folderName) {
@@ -408,10 +429,10 @@ const TOOLS = [
       type: "object",
       properties: {
         mode: { type: "string", enum: ["new", "reply", "forward"], description: "Compose mode." },
-        to: { type: "string", description: "Recipient (new)." },
+        to: { oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }], description: "Recipient(s). String, comma-separated string, or array." },
         subject: { type: "string", description: "Subject (new)." },
         body: { type: "string", description: "Markdown body." },
-        cc: { type: "string", description: "CC recipient." },
+        cc: { oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }], description: "CC recipient(s). String, comma-separated string, or array." },
         email_id: { type: "number", description: "Email ID (reply/forward)." },
         reply_all: { type: "boolean", description: "Reply all." },
       },
@@ -739,8 +760,8 @@ function handleCompose(args) {
 
 function composeNew(args, body, htmlBody) {
   const subject = args?.subject || "";
-  const to = args?.to || "";
-  const cc = args?.cc || "";
+  const toAddrs = parseRecipients(args?.to);
+  const ccAddrs = parseRecipients(args?.cc);
 
   // Try RTF injection first
   if (body.trim()) {
@@ -750,8 +771,8 @@ function composeNew(args, body, htmlBody) {
       tmpPath = rtf.tmpPath;
       let script = `tell application "Microsoft Outlook"
     set newMsg to make new outgoing message with properties {subject:"${escapeForAppleScript(subject)}"}`;
-      if (to) script += `\n    make new to recipient at newMsg with properties {email address:{address:"${escapeForAppleScript(to)}"}}`;
-      if (cc) script += `\n    make new cc recipient at newMsg with properties {email address:{address:"${escapeForAppleScript(cc)}"}}`;
+      if (toAddrs.length) script += `\n    ${recipientLines(toAddrs, "to", "newMsg")}`;
+      if (ccAddrs.length) script += `\n    ${recipientLines(ccAddrs, "cc", "newMsg")}`;
       script += `\n    ${rtf.snippet}`;
       script += `\n    open newMsg\n    activate\nend tell`;
       runAppleScriptHeredoc(script);
@@ -768,8 +789,8 @@ function composeNew(args, body, htmlBody) {
   const escapedBody = htmlBody.replace(/"/g, '\\"');
   let script = `tell application "Microsoft Outlook"
     set newMsg to make new outgoing message with properties {subject:"${escapeForAppleScript(subject)}", content:"${escapedBody}"}`;
-  if (to) script += `\n    make new to recipient at newMsg with properties {email address:{address:"${escapeForAppleScript(to)}"}}`;
-  if (cc) script += `\n    make new cc recipient at newMsg with properties {email address:{address:"${escapeForAppleScript(cc)}"}}`;
+  if (toAddrs.length) script += `\n    ${recipientLines(toAddrs, "to", "newMsg")}`;
+  if (ccAddrs.length) script += `\n    ${recipientLines(ccAddrs, "cc", "newMsg")}`;
   script += `\n    open newMsg\n    activate\nend tell`;
   runAppleScriptHeredoc(script);
   return ok(`Draft created: ${subject}`);
