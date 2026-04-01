@@ -294,13 +294,21 @@ function resolveInboxIds() {
 
 const FTS_DIR = path.join(os.homedir(), ".mcp-outlook-mac");
 const FTS_DB = path.join(FTS_DIR, "body-index.db");
+const INDEX_BATCH_SIZE = 10000;
+const INDEX_REFRESH_INTERVAL_MS = 60 * 1000;
+let indexRefreshRunning = false;
+let indexRefreshTimer = null;
 
-function runFts(query) {
+function runFts(query, options = {}) {
   const q = query.replace(/\s+/g, " ").trim();
   try {
     return execSync(
       `sqlite3 ${JSON.stringify(FTS_DB)} ${JSON.stringify(q)}`,
-      { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 10000 }
+      {
+        encoding: "utf-8",
+        maxBuffer: 10 * 1024 * 1024,
+        timeout: options.timeout || 10000,
+      }
     ).trim();
   } catch (error) {
     throw new Error(`FTS error: ${(error.message || "").slice(0, 200)}`);
@@ -344,25 +352,76 @@ function indexEmail(emailId, subject, sender, bodyText) {
   } catch {}
 }
 
-function runIndexPass() {
-  try {
-    // Find unindexed emails and index them using Outlook's preview + AppleScript for full body
-    const unindexed = runSqlite(`
-      SELECT m.Record_RecordID as id, m.Message_NormalizedSubject as subject,
-             m.Message_SenderList as sender, m.Message_Preview as preview
-      FROM Mail m
-      WHERE m.Record_RecordID NOT IN (SELECT id FROM (SELECT ${Number(0)} as id))
-      ORDER BY m.Message_TimeReceived DESC
-      LIMIT 500
-    `);
-    // Check which ones are already indexed
-    for (const row of unindexed) {
-      if (!isIndexed(row.id)) {
-        // Use preview as body — not full text, but enough for FTS
-        indexEmail(row.id, row.subject, row.sender, row.preview || "");
-      }
-    }
-  } catch {}
+function syncFtsIndex(options = {}) {
+  ensureFtsDb();
+
+  const batchSize = Math.max(1, Number(options.batchSize) || INDEX_BATCH_SIZE);
+  const maxBatches = Math.max(1, Number(options.maxBatches) || Number.MAX_SAFE_INTEGER);
+  const escapedDbPath = DB_PATH.replace(/'/g, "''");
+  let batches = 0;
+  let inserted = 0;
+  let lastBatchSize = 0;
+
+  while (batches < maxBatches) {
+    const batchInserted = Number(runFts(`
+      ATTACH DATABASE '${escapedDbPath}' AS outlook;
+      DROP TABLE IF EXISTS temp.batch_rows;
+      CREATE TEMP TABLE batch_rows AS
+      SELECT
+        m.Record_RecordID AS id,
+        COALESCE(m.Message_NormalizedSubject, '') AS subject,
+        COALESCE(m.Message_SenderList, '') AS sender,
+        COALESCE(m.Message_Preview, '') AS body
+      FROM outlook.Mail m
+      LEFT JOIN indexed i ON i.id = m.Record_RecordID
+      LEFT JOIN bodies b ON b.id = m.Record_RecordID
+      WHERE i.id IS NULL OR b.id IS NULL
+      ORDER BY m.Record_RecordID
+      LIMIT ${batchSize};
+      BEGIN;
+      INSERT OR IGNORE INTO bodies (id, subject, sender, body)
+      SELECT id, subject, sender, body FROM batch_rows;
+      INSERT OR IGNORE INTO indexed (id, ts)
+      SELECT id, strftime('%s', 'now') FROM batch_rows;
+      COMMIT;
+      SELECT COUNT(*) FROM batch_rows;
+      DROP TABLE temp.batch_rows;
+      DETACH DATABASE outlook;
+    `, { timeout: 60000 }));
+
+    lastBatchSize = Number.isFinite(batchInserted) ? batchInserted : 0;
+    inserted += lastBatchSize;
+    batches++;
+
+    if (lastBatchSize < batchSize) break;
+  }
+
+  return {
+    batches,
+    indexed: inserted,
+    complete: lastBatchSize < batchSize,
+    stats: ftsIndexStats(),
+  };
+}
+
+function triggerIndexRefresh() {
+  if (indexRefreshRunning) return;
+  indexRefreshRunning = true;
+
+  setImmediate(() => {
+    try {
+      syncFtsIndex({ maxBatches: 1 });
+    } catch {}
+    indexRefreshRunning = false;
+  });
+}
+
+function startIndexRefreshLoop() {
+  if (indexRefreshTimer) return;
+  indexRefreshTimer = setInterval(() => {
+    triggerIndexRefresh();
+  }, INDEX_REFRESH_INTERVAL_MS);
+  if (typeof indexRefreshTimer.unref === "function") indexRefreshTimer.unref();
 }
 
 function ftsIndexStats() {
@@ -481,7 +540,7 @@ const TOOLS = [
   },
   {
     name: "search_body",
-    description: "Full-text body search (FTS5 index). Builds incrementally as emails are read.",
+    description: "Full-text body search (FTS5 index). Index refreshes in the background.",
     inputSchema: {
       type: "object",
       properties: {
@@ -493,7 +552,7 @@ const TOOLS = [
   },
   {
     name: "index_now",
-    description: "Trigger immediate FTS5 index pass. Use before search_body for complete results.",
+    description: "Build or catch up the full FTS5 index immediately.",
     inputSchema: { type: "object", properties: {} },
   },
 ];
@@ -1045,6 +1104,7 @@ function handleSearchBody(args) {
   const query = args?.query;
   if (!query) return err("query is required.");
   const limit = args?.limit || 20;
+  triggerIndexRefresh();
 
   const escapedQuery = query.replace(/'/g, "''").replace(/"/g, '""');
 
@@ -1094,15 +1154,16 @@ function handleSearchBody(args) {
 // --- Handler: index_now ---
 
 function handleIndexNow() {
-  runIndexPass();
-  const stats = ftsIndexStats();
-  return ok(`Index pass complete. ${ftsStatusLine(stats)}`);
+  const result = syncFtsIndex();
+  return ok(`Index sync complete after ${result.batches} batch(es). ${ftsStatusLine(result.stats)}`);
 }
 
 // --- Start server ---
 
 async function main() {
   ensureFtsDb();
+  startIndexRefreshLoop();
+  triggerIndexRefresh();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("Outlook MCP server running on stdio");
