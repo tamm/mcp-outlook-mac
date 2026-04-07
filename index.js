@@ -472,11 +472,12 @@ const TOOLS = [
   },
   {
     name: "get_email",
-    description: "Get full email content by ID. Strips signatures and quoted replies.",
+    description: "Get full email content by ID. Strips signatures and quoted replies by default.",
     inputSchema: {
       type: "object",
       properties: {
         email_id: { type: "number", description: "Email ID from search_emails." },
+        include_quoted: { type: "boolean", description: "Keep quoted replies and signatures (default false)." },
       },
       required: ["email_id"],
     },
@@ -783,7 +784,7 @@ end tell`;
   if (bodyMarker !== -1) {
     const headers = result.slice(0, bodyMarker);
     const rawBody = result.slice(bodyMarker + 2);
-    output = headers + "\n\n" + cleanBody(rawBody);
+    output = headers + "\n\n" + (args?.include_quoted ? rawBody.trim() : cleanBody(rawBody));
   } else {
     output = result;
   }

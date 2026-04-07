@@ -16,7 +16,7 @@ To fix: **Help > Revert to Legacy Outlook**. Once reverted, all tools work.
 |------|-------------|
 | `list_folders` | Lists all folders with message counts |
 | `search_emails` | Search or list emails by subject/sender. Supports date range, unread filter, sort, account filter |
-| `get_email` | Full email content by ID. Strips signatures and quoted replies. Shows read/flagged status |
+| `get_email` | Full email content by ID. Strips signatures and quoted replies by default; pass `include_quoted: true` to keep them. Shows read/flagged status |
 | `compose` | Draft new email, reply, or forward. Body is markdown |
 | `move_email` | Move email to a folder (e.g. Archive) |
 | `archive_emails` | Batch archive — moves multiple emails to Archive |
@@ -51,13 +51,15 @@ Everything is in `index.js`. The tool definitions in `index.js` are the source o
 
 ### Signature and quote stripping
 
-`get_email` runs `cleanBody()` which strips:
+`get_email` runs `cleanBody()` by default which strips:
 - Standard `-- ` signatures
 - Mobile signatures (Sent from my iPhone/iPad/Galaxy, Get Outlook for iOS/Android)
 - "On ... wrote:" quoted reply chains
 - Outlook-style "From: ... Sent: ..." blocks
 - Trailing `>` quoted lines
 - Forwarded message delimiters
+
+Pass `include_quoted: true` to skip all stripping and return the full raw body.
 
 ### Compose with RTF injection
 
