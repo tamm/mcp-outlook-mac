@@ -875,30 +875,46 @@ end tell`;
     ? (replyAll ? "reply to targetMsg with reply to all" : "reply to targetMsg")
     : "forward targetMsg";
 
-  // Try RTF injection first
+  // Try RTF injection first — open window, then inject body
   if (body.trim()) {
     let tmpPath = null;
+    let windowOpened = false;
     try {
       const rtf = setRtfBody(htmlBody, "composeMsg");
       tmpPath = rtf.tmpPath;
-      const script = `
+      // Open the reply window first
+      const openScript = `
 tell application "Microsoft Outlook"
     activate
 ${findMessageScript(emailId)}
     set composeMsg to ${action} with opening window
+end tell`;
+      runAppleScriptHeredoc(openScript);
+      windowOpened = true;
+      // Inject RTF into the already-open window
+      const injectScript = `
+tell application "Microsoft Outlook"
+    set composeMsg to message of front window
     ${rtf.snippet}
 end tell`;
-      const result = runAppleScriptHeredoc(script);
+      const result = runAppleScriptHeredoc(injectScript);
       if (result && result.startsWith("Error:")) return err(result.slice(7));
       return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
     } catch (rtfErr) {
-      console.error(`RTF injection failed, falling back to clipboard paste: ${rtfErr.message}`);
+      console.error(`RTF injection failed (windowOpened=${windowOpened}), falling back to clipboard paste: ${rtfErr.message}`);
+      // If window already opened, paste into it — don't open another
+      if (windowOpened) {
+        if (body.trim()) pasteViaClipboard(htmlBody);
+        const result = runAppleScriptHeredoc(pasteIntoFrontWindow());
+        if (result && result.startsWith("Error:")) return err(result.slice(7));
+        return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
+      }
     } finally {
       if (tmpPath) try { fs.unlinkSync(tmpPath); } catch {}
     }
   }
 
-  // Fallback: clipboard paste via System Events
+  // Fallback: no window open yet — open it and clipboard paste
   if (body.trim()) pasteViaClipboard(htmlBody);
 
   const pasteScript = `
