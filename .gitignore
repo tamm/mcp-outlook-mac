@@ -1,3 +1,6 @@
 node_modules/
 .env
 .env.*
+
+# Clacks inter-session messaging
+.clacks/

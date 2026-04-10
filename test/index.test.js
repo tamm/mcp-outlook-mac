@@ -9,6 +9,8 @@ import {
   stripQuotedReplies,
   cleanBody,
   markdownToHtml,
+  coerceEmailIds,
+  setRecipientsScript,
 } from "../index.js";
 
 describe("extractEmail", () => {
@@ -239,5 +241,94 @@ describe("markdownToHtml", () => {
     const result = markdownToHtml("hello world");
     assert.ok(result.includes("<p>hello world</p>"));
     assert.ok(result.includes("font-family"));
+  });
+});
+
+describe("coerceEmailIds", () => {
+  it("handles a normal array of numbers", () => {
+    assert.deepEqual(coerceEmailIds([32455, 32456]), [32455, 32456]);
+  });
+
+  it("handles a single number", () => {
+    assert.deepEqual(coerceEmailIds(32455), [32455]);
+  });
+
+  it("handles a JSON string array", () => {
+    assert.deepEqual(coerceEmailIds("[32455, 32456, 32457]"), [32455, 32456, 32457]);
+  });
+
+  it("handles a single number as string", () => {
+    assert.deepEqual(coerceEmailIds("32455"), [32455]);
+  });
+
+  it("handles an array of string numbers", () => {
+    assert.deepEqual(coerceEmailIds(["32455", "32456"]), [32455, 32456]);
+  });
+
+  it("returns empty for null", () => {
+    assert.deepEqual(coerceEmailIds(null), []);
+  });
+
+  it("returns empty for undefined", () => {
+    assert.deepEqual(coerceEmailIds(undefined), []);
+  });
+
+  it("returns empty for empty array", () => {
+    assert.deepEqual(coerceEmailIds([]), []);
+  });
+
+  it("returns empty for empty string", () => {
+    assert.deepEqual(coerceEmailIds(""), []);
+  });
+
+  it("filters out NaN and zero values", () => {
+    assert.deepEqual(coerceEmailIds([32455, "abc", 0, -1, 32456]), [32455, 32456]);
+  });
+
+  it("handles non-parseable garbage string", () => {
+    assert.deepEqual(coerceEmailIds("not-a-number"), []);
+  });
+
+  it("handles a stringified single number in JSON", () => {
+    assert.deepEqual(coerceEmailIds('"32455"'), [32455]);
+  });
+
+  it("handles mixed array of numbers and strings", () => {
+    assert.deepEqual(coerceEmailIds([32455, "32456", 32457]), [32455, 32456, 32457]);
+  });
+});
+
+describe("setRecipientsScript", () => {
+  it("generates delete and make lines for to and cc", () => {
+    const result = setRecipientsScript(["a@example.com"], ["b@example.com"], "composeMsg");
+    assert.ok(result.includes("delete every to recipient of composeMsg"));
+    assert.ok(result.includes("delete every cc recipient of composeMsg"));
+    assert.ok(result.includes("a@example.com"));
+    assert.ok(result.includes("b@example.com"));
+    assert.ok(result.includes("make new to recipient"));
+    assert.ok(result.includes("make new cc recipient"));
+  });
+
+  it("handles empty to and cc arrays", () => {
+    const result = setRecipientsScript([], [], "composeMsg");
+    assert.ok(result.includes("delete every to recipient"));
+    assert.ok(result.includes("delete every cc recipient"));
+    assert.ok(!result.includes("make new"));
+  });
+
+  it("handles null/undefined to and cc gracefully", () => {
+    const result = setRecipientsScript(null, undefined, "msg");
+    assert.ok(result.includes("delete every to recipient"));
+    assert.ok(!result.includes("make new"));
+  });
+
+  it("filters out falsy entries in arrays", () => {
+    const result = setRecipientsScript(["a@example.com", "", null, "b@example.com"], [], "msg");
+    assert.equal(result.split("make new").length - 1, 2);
+  });
+
+  it("escapes special characters in addresses", () => {
+    const result = setRecipientsScript(['o"malley@example.com'], [], "msg");
+    assert.ok(result.includes('o\\"malley@example.com'));
   });
 });

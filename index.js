@@ -778,22 +778,36 @@ end tell`;
   const result = runAppleScriptHeredoc(script);
   if (result === "NOT_FOUND") return err(`Email ${emailId} not found.`);
 
+  // Supplement CC from DB if AppleScript returned none (Outlook UI/AS bug can hide CC)
+  let resultWithCc = result;
+  if (!/^CC: .+/m.test(result)) {
+    try {
+      const rows = runSqlite(
+        `SELECT Message_CCRecipientAddressList FROM Mail WHERE Record_RecordID = ${Number(emailId)} LIMIT 1`
+      );
+      const dbCc = rows?.[0]?.Message_CCRecipientAddressList;
+      if (dbCc && dbCc.trim()) {
+        resultWithCc = result.replace(/^(To: .*)$/m, `$1\nCC: ${dbCc}`);
+      }
+    } catch {}
+  }
+
   // Split off headers from body for cleaning
-  const bodyMarker = result.indexOf("\n\n");
+  const bodyMarker = resultWithCc.indexOf("\n\n");
   let output;
   if (bodyMarker !== -1) {
-    const headers = result.slice(0, bodyMarker);
-    const rawBody = result.slice(bodyMarker + 2);
+    const headers = resultWithCc.slice(0, bodyMarker);
+    const rawBody = resultWithCc.slice(bodyMarker + 2);
     output = headers + "\n\n" + (args?.include_quoted ? rawBody.trim() : cleanBody(rawBody));
   } else {
-    output = result;
+    output = resultWithCc;
   }
 
   // Index for FTS (fire-and-forget)
   try {
-    const subjectMatch = result.match(/^Subject: (.*)$/m);
-    const senderMatch = result.match(/^From: (.*)$/m);
-    const bodyText = bodyMarker !== -1 ? result.slice(bodyMarker + 2) : "";
+    const subjectMatch = resultWithCc.match(/^Subject: (.*)$/m);
+    const senderMatch = resultWithCc.match(/^From: (.*)$/m);
+    const bodyText = bodyMarker !== -1 ? resultWithCc.slice(bodyMarker + 2) : "";
     indexEmail(emailId, subjectMatch?.[1] || "", senderMatch?.[1] || "", bodyText);
   } catch {}
 
@@ -856,6 +870,40 @@ function composeNew(args, body, htmlBody) {
   return ok(`Draft created: ${subject}`);
 }
 
+function getReplyRecipients(emailId, replyAll) {
+  // Query the original email's actual recipients from the DB
+  const rows = runSqlite(
+    `SELECT Message_SenderAddressList, Message_ToRecipientAddressList, Message_CCRecipientAddressList
+     FROM Mail WHERE Record_RecordID = ${Number(emailId)} LIMIT 1`
+  );
+  if (!rows || rows.length === 0) return null;
+  const row = rows[0];
+  const sender = parseRecipients(row.Message_SenderAddressList);
+  if (!replyAll) return { to: sender, cc: [] };
+  const toList = parseRecipients(row.Message_ToRecipientAddressList);
+  const ccList = parseRecipients(row.Message_CCRecipientAddressList);
+  // Reply-all: To = original sender, CC = original To + CC minus the sender
+  const senderSet = new Set(sender.map(s => s.toLowerCase()));
+  const cc = [...toList, ...ccList].filter(a => !senderSet.has(a.toLowerCase()));
+  return { to: sender, cc };
+}
+
+function setRecipientsScript(toAddrs, ccAddrs, msgVar) {
+  const to = Array.isArray(toAddrs) ? toAddrs.filter(Boolean) : [];
+  const cc = Array.isArray(ccAddrs) ? ccAddrs.filter(Boolean) : [];
+  const lines = [];
+  // Clear existing recipients first
+  lines.push(`delete every to recipient of ${msgVar}`);
+  lines.push(`delete every cc recipient of ${msgVar}`);
+  for (const addr of to) {
+    lines.push(`make new to recipient at ${msgVar} with properties {email address:{address:"${escapeForAppleScript(addr)}"}}`);
+  }
+  for (const addr of cc) {
+    lines.push(`make new cc recipient at ${msgVar} with properties {email address:{address:"${escapeForAppleScript(addr)}"}}`);
+  }
+  return lines.join("\n    ");
+}
+
 function composeReplyOrForward(args, mode, body, htmlBody) {
   const emailId = args?.email_id;
   if (!emailId) return err("email_id required for reply/forward.");
@@ -871,9 +919,25 @@ end tell`;
   const findResult = runAppleScriptHeredoc(findScript);
   if (findResult === "NOT_FOUND") return err(`Email ${emailId} not found.`);
 
+  // For reply mode with reply_all, use plain reply then set recipients from DB
+  // This avoids Outlook's buggy auto-population that adds phantom recipients
   const action = mode === "reply"
-    ? (replyAll ? "reply to targetMsg with reply to all" : "reply to targetMsg")
+    ? "reply to targetMsg"
     : "forward targetMsg";
+
+  // Determine recipients: explicit args override, else derive from DB
+  let recipientOverride = null;
+  if (mode === "reply") {
+    const explicitTo = parseRecipients(args?.to);
+    const explicitCc = parseRecipients(args?.cc);
+    if (explicitTo.length || explicitCc.length || replyAll) {
+      if (explicitTo.length || explicitCc.length) {
+        recipientOverride = { to: explicitTo, cc: explicitCc };
+      } else {
+        recipientOverride = getReplyRecipients(emailId, replyAll);
+      }
+    }
+  }
 
   // Try RTF injection first — open window, then inject body
   if (body.trim()) {
@@ -891,11 +955,16 @@ ${findMessageScript(emailId)}
 end tell`;
       runAppleScriptHeredoc(openScript);
       windowOpened = true;
-      // Inject RTF into the already-open window
+      // Wait for the compose window to fully initialize
+      execSync("sleep 1", { shell: "/bin/bash" });
+      // Inject RTF and fix recipients on the already-open window
+      const recipientFix = recipientOverride
+        ? `\n    ${setRecipientsScript(recipientOverride.to, recipientOverride.cc, "composeMsg")}`
+        : "";
       const injectScript = `
 tell application "Microsoft Outlook"
     set composeMsg to message of front window
-    ${rtf.snippet}
+    ${rtf.snippet}${recipientFix}
 end tell`;
       const result = runAppleScriptHeredoc(injectScript);
       if (result && result.startsWith("Error:")) return err(result.slice(7));
@@ -907,6 +976,15 @@ end tell`;
         if (body.trim()) pasteViaClipboard(htmlBody);
         const result = runAppleScriptHeredoc(pasteIntoFrontWindow());
         if (result && result.startsWith("Error:")) return err(result.slice(7));
+        // Fix recipients even in fallback path
+        if (recipientOverride) {
+          const fixScript = `
+tell application "Microsoft Outlook"
+    set composeMsg to message of front window
+    ${setRecipientsScript(recipientOverride.to, recipientOverride.cc, "composeMsg")}
+end tell`;
+          try { runAppleScriptHeredoc(fixScript); } catch {}
+        }
         return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
       }
     } finally {
@@ -917,12 +995,18 @@ end tell`;
   // Fallback: no window open yet — open it and clipboard paste
   if (body.trim()) pasteViaClipboard(htmlBody);
 
+  const recipientFix = recipientOverride
+    ? `\n    set composeMsg to message of front window\n    ${setRecipientsScript(recipientOverride.to, recipientOverride.cc, "composeMsg")}`
+    : "";
   const pasteScript = `
 tell application "Microsoft Outlook"
     activate
 ${findMessageScript(emailId)}
-    ${action}
+    ${action} with opening window
 end tell
+delay 1${recipientFix ? `
+tell application "Microsoft Outlook"${recipientFix}
+end tell` : ""}
 ${body.trim() ? pasteIntoFrontWindow() : ""}`;
 
   const result = runAppleScriptHeredoc(pasteScript);
@@ -984,9 +1068,19 @@ end tell`;
 
 // --- Handler: archive_emails ---
 
+function coerceEmailIds(raw) {
+  if (raw == null) return [];
+  let ids = raw;
+  if (typeof ids === "string") {
+    try { ids = JSON.parse(ids); } catch { ids = [ids]; }
+  }
+  if (!Array.isArray(ids)) ids = [ids];
+  return ids.map(Number).filter(n => !isNaN(n) && n > 0);
+}
+
 function handleArchiveEmails(args) {
-  const emailIds = args?.email_ids;
-  if (!emailIds || emailIds.length === 0) return err("email_ids required.");
+  const emailIds = coerceEmailIds(args?.email_ids);
+  if (emailIds.length === 0) return err("email_ids required.");
 
   // Group emails by account for efficient batch moves
   const byAccount = {};
@@ -1200,4 +1294,6 @@ export {
   stripQuotedReplies,
   cleanBody,
   markdownToHtml,
+  coerceEmailIds,
+  setRecipientsScript,
 };
