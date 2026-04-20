@@ -455,18 +455,18 @@ const TOOLS = [
   },
   {
     name: "search_emails",
-    description: "Search or list emails by subject/sender. Omit query for recent emails.",
+    description: "List inbox emails matching optional filters. Omit all filters to return the full inbox (newest first). Bias toward unbounded scope — only narrow when the task actually requires it. Good for triage, where missing older unread items is worse than a larger result set.",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Search subject/sender. Omit for recent." },
-        folder: { type: "string", description: "Folder (default: all Inboxes)." },
-        account: { type: "string", description: "Account name. Omit for all." },
-        limit: { type: "number", description: "Max results (default 10, max 50)." },
+        query: { type: "string", description: "Optional substring match on subject or sender. Omit to match all emails." },
+        folder: { type: "string", description: "Optional folder name. Omit to search all Inboxes." },
+        account: { type: "string", description: "Optional account name. Omit to search all accounts." },
+        limit: { type: "number", description: "Optional max results (hard cap 1000). Omit to return up to 500 — prefer omitting for triage so older items are not missed." },
         unread_only: { type: "boolean", description: "Only unread emails." },
         sort: { type: "string", enum: ["desc", "asc"], description: "Sort by date (default: desc)." },
-        after: { type: "string", description: "Only after this date (YYYY-MM-DD)." },
-        before: { type: "string", description: "Only before this date (YYYY-MM-DD)." },
+        after: { type: "string", description: "Optional date lower bound (YYYY-MM-DD). Only use when you specifically need to bound by date. Omit to search regardless of date." },
+        before: { type: "string", description: "Optional date upper bound (YYYY-MM-DD). Only use when you specifically need to bound by date. Omit to search regardless of date." },
       },
     },
   },
@@ -541,12 +541,12 @@ const TOOLS = [
   },
   {
     name: "search_body",
-    description: "Full-text body search (FTS5 index). Index refreshes in the background.",
+    description: "Full-text body search across all indexed emails (FTS5, BM25-ranked). Index refreshes in the background. Bias toward unbounded scope — only narrow limit when the task actually requires it.",
     inputSchema: {
       type: "object",
       properties: {
         query: { type: "string", description: "Search terms." },
-        limit: { type: "number", description: "Max results (default 20)." },
+        limit: { type: "number", description: "Optional max results (hard cap 1000). Omit to return up to 500." },
       },
       required: ["query"],
     },
@@ -611,7 +611,7 @@ function handleSearchEmails(args) {
   const query = args?.query || null;
   const folderName = args?.folder || null;
   const accountName = args?.account || null;
-  const limit = Math.min(args?.limit || 10, 50);
+  const limit = Math.min(args?.limit || 500, 1000);
   const sortDir = args?.sort === "asc" ? "ASC" : "DESC";
 
   // Resolve folder filter
@@ -1214,7 +1214,7 @@ end tell`;
 function handleSearchBody(args) {
   const query = args?.query;
   if (!query) return err("query is required.");
-  const limit = args?.limit || 20;
+  const limit = Math.min(args?.limit || 500, 1000);
   triggerIndexRefresh();
 
   const escapedQuery = query.replace(/'/g, "''").replace(/"/g, '""');

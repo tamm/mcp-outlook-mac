@@ -15,7 +15,7 @@ To fix: **Help > Revert to Legacy Outlook**. Once reverted, all tools work.
 | Tool | What it does |
 |------|-------------|
 | `list_folders` | Lists all folders with message counts |
-| `search_emails` | Search or list emails by subject/sender. Supports date range, unread filter, sort, account filter |
+| `search_emails` | List inbox emails matching optional filters. Defaults to the full inbox (newest first) — narrow only when needed. Supports subject/sender query, date range, unread filter, sort, account filter |
 | `get_email` | Full email content by ID. Strips signatures and quoted replies by default; pass `include_quoted: true` to keep them. Shows read/flagged status |
 | `compose` | Draft new email, reply, or forward. Body is markdown |
 | `move_email` | Move email to a folder (e.g. Archive) |
@@ -67,12 +67,13 @@ The `compose` tool uses `textutil` to convert markdown→HTML→RTF, then inject
 
 ### Search features
 
-`search_emails` supports:
-- `query` — subject/sender search (omit for recent emails)
+`search_emails` lists all Inbox emails by default (up to 500, hard cap 1000) and biases toward unbounded scope — callers should only narrow when the task actually requires it. All filters are optional:
+- `query` — substring match on subject/sender
 - `folder` — restrict to a folder (default: all Inboxes)
 - `account` — restrict to an account
 - `unread_only` — only unread emails
-- `after` / `before` — date range (YYYY-MM-DD)
+- `after` / `before` — date bounds (YYYY-MM-DD) — omit for no date bound
+- `limit` — optional max results (default 500, hard cap 1000)
 - `sort` — `desc` (default) or `asc`
 
 Results show `●` for unread, `⚑` for flagged, `📎` for attachments.
