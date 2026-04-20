@@ -4,3 +4,7 @@ node_modules/
 
 # Clacks inter-session messaging
 .clacks/
+
+# Agent notes (local only)
+CLAUDE.md
+.claude/
