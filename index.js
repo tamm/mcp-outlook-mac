@@ -253,18 +253,32 @@ function escapeForAppleScript(str) {
 }
 
 function extractEmail(raw) {
-  const s = raw.trim();
+  if (raw == null) return "";
+  let s = String(raw).trim();
   if (!s) return "";
   // "Display Name <email@example.com>" → email@example.com
   const angleMatch = s.match(/<([^>]+)>/);
   if (angleMatch) return angleMatch[1].trim();
+  // Strip leading/trailing JSON-array/quote junk from malformed upstream input
+  s = s.replace(/^[\[\s"']+/, "").replace(/[\]\s"']+$/, "");
   return s;
 }
 
 function parseRecipients(input) {
   if (!input) return [];
   if (Array.isArray(input)) return input.map(extractEmail).filter(Boolean);
-  return input.split(/[,;]/).map(extractEmail).filter(Boolean);
+  // Defensive: some clients stringify arrays. Try JSON-parse if it looks like one.
+  if (typeof input === "string") {
+    const trimmed = input.trim();
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) return parsed.map(extractEmail).filter(Boolean);
+      } catch {}
+    }
+    return trimmed.split(/[,;]/).map(extractEmail).filter(Boolean);
+  }
+  return [];
 }
 
 function recipientLines(addresses, type, msgVar) {
@@ -870,36 +884,26 @@ function composeNew(args, body, htmlBody) {
   return ok(`Draft created: ${subject}`);
 }
 
-function getReplyRecipients(emailId, replyAll) {
-  // Query the original email's actual recipients from the DB
-  const rows = runSqlite(
-    `SELECT Message_SenderAddressList, Message_ToRecipientAddressList, Message_CCRecipientAddressList
-     FROM Mail WHERE Record_RecordID = ${Number(emailId)} LIMIT 1`
-  );
-  if (!rows || rows.length === 0) return null;
-  const row = rows[0];
-  const sender = parseRecipients(row.Message_SenderAddressList);
-  if (!replyAll) return { to: sender, cc: [] };
-  const toList = parseRecipients(row.Message_ToRecipientAddressList);
-  const ccList = parseRecipients(row.Message_CCRecipientAddressList);
-  // Reply-all: To = original sender, CC = original To + CC minus the sender
-  const senderSet = new Set(sender.map(s => s.toLowerCase()));
-  const cc = [...toList, ...ccList].filter(a => !senderSet.has(a.toLowerCase()));
-  return { to: sender, cc };
-}
-
+// Build an AppleScript snippet that wipes and rebuilds recipient lists.
+// Only the fields explicitly provided are touched; the other is left as-is
+// (e.g. reply-all's native CC is preserved when the caller overrides only `to`).
 function setRecipientsScript(toAddrs, ccAddrs, msgVar) {
-  const to = Array.isArray(toAddrs) ? toAddrs.filter(Boolean) : [];
-  const cc = Array.isArray(ccAddrs) ? ccAddrs.filter(Boolean) : [];
+  const hasTo = Array.isArray(toAddrs);
+  const hasCc = Array.isArray(ccAddrs);
+  const to = hasTo ? toAddrs.filter(Boolean) : [];
+  const cc = hasCc ? ccAddrs.filter(Boolean) : [];
   const lines = [];
-  // Clear existing recipients first
-  lines.push(`delete every to recipient of ${msgVar}`);
-  lines.push(`delete every cc recipient of ${msgVar}`);
-  for (const addr of to) {
-    lines.push(`make new to recipient at ${msgVar} with properties {email address:{address:"${escapeForAppleScript(addr)}"}}`);
+  if (hasTo) {
+    lines.push(`delete every to recipient of ${msgVar}`);
+    for (const addr of to) {
+      lines.push(`make new to recipient at ${msgVar} with properties {email address:{address:"${escapeForAppleScript(addr)}"}}`);
+    }
   }
-  for (const addr of cc) {
-    lines.push(`make new cc recipient at ${msgVar} with properties {email address:{address:"${escapeForAppleScript(addr)}"}}`);
+  if (hasCc) {
+    lines.push(`delete every cc recipient of ${msgVar}`);
+    for (const addr of cc) {
+      lines.push(`make new cc recipient at ${msgVar} with properties {email address:{address:"${escapeForAppleScript(addr)}"}}`);
+    }
   }
   return lines.join("\n    ");
 }
@@ -919,23 +923,23 @@ end tell`;
   const findResult = runAppleScriptHeredoc(findScript);
   if (findResult === "NOT_FOUND") return err(`Email ${emailId} not found.`);
 
-  // For reply mode with reply_all, use plain reply then set recipients from DB
-  // This avoids Outlook's buggy auto-population that adds phantom recipients
+  // Use Outlook's native reply-all — it populates recipients correctly on its own.
   const action = mode === "reply"
-    ? "reply to targetMsg"
+    ? (replyAll ? "reply to targetMsg reply to all true" : "reply to targetMsg")
     : "forward targetMsg";
 
-  // Determine recipients: explicit args override, else derive from DB
+  // Only override recipients when the caller explicitly passes `to`/`cc`.
+  // Provided field wipes and rebuilds that field only; the other is left untouched
+  // so native reply/reply-all population is preserved for the unspecified side.
   let recipientOverride = null;
   if (mode === "reply") {
-    const explicitTo = parseRecipients(args?.to);
-    const explicitCc = parseRecipients(args?.cc);
-    if (explicitTo.length || explicitCc.length || replyAll) {
-      if (explicitTo.length || explicitCc.length) {
-        recipientOverride = { to: explicitTo, cc: explicitCc };
-      } else {
-        recipientOverride = getReplyRecipients(emailId, replyAll);
-      }
+    const hasTo = args?.to != null;
+    const hasCc = args?.cc != null;
+    if (hasTo || hasCc) {
+      recipientOverride = {
+        to: hasTo ? parseRecipients(args.to) : null,
+        cc: hasCc ? parseRecipients(args.cc) : null,
+      };
     }
   }
 

@@ -65,6 +65,21 @@ Pass `include_quoted: true` to skip all stripping and return the full raw body.
 
 The `compose` tool uses `textutil` to convert markdown→HTML→RTF, then injects the RTF directly into the message via `read POSIX file ... as «class RTF »`. This avoids clipboard hijacking.
 
+### Reply and reply-all recipient handling
+
+`compose` with `mode: "reply"` delegates recipient population to Outlook's native `reply to` AppleScript command. When `reply_all: true`, the native `reply to all true` parameter is used — recipients are populated by Outlook itself, never reconstructed from the SQLite database.
+
+The `to` and `cc` arguments are **optional overrides** with per-field semantics:
+
+- Omit both → native reply / reply-all population is used as-is
+- Provide `to` only → `to` is wiped and rebuilt from the arg; native `cc` is preserved
+- Provide `cc` only → `cc` is wiped and rebuilt from the arg; native `to` is preserved
+- Provide both → both fields wiped and rebuilt
+
+This means a caller can add an extra CC to a reply-all without having to re-specify the native To list, or redirect the `to` while keeping the auto-populated CC chain.
+
+`to` and `cc` accept a string, a comma/semicolon-separated string, a JSON array, or a JSON-stringified array (defensive: some MCP clients stringify array-typed args on the wire).
+
 ### Search features
 
 `search_emails` lists all Inbox emails by default (up to 500, hard cap 1000) and biases toward unbounded scope — callers should only narrow when the task actually requires it. All filters are optional:

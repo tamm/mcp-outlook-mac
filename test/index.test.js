@@ -86,6 +86,21 @@ describe("parseRecipients", () => {
   it("filters out empty entries", () => {
     assert.deepEqual(parseRecipients("a@example.com,,b@example.com"), ["a@example.com", "b@example.com"]);
   });
+
+  it("handles JSON-stringified array input", () => {
+    assert.deepEqual(
+      parseRecipients('["cameron@example.com", "iblomley@example.com"]'),
+      ["cameron@example.com", "iblomley@example.com"]
+    );
+  });
+
+  it("strips bracket/quote junk from malformed comma split", () => {
+    // Simulates the legacy broken path — result should still be clean emails.
+    assert.deepEqual(
+      parseRecipients('["a@example.com","b@example.com"]'),
+      ["a@example.com", "b@example.com"]
+    );
+  });
 });
 
 describe("recipientLines", () => {
@@ -316,10 +331,25 @@ describe("setRecipientsScript", () => {
     assert.ok(!result.includes("make new"));
   });
 
-  it("handles null/undefined to and cc gracefully", () => {
+  it("returns empty when both to and cc are null/undefined", () => {
     const result = setRecipientsScript(null, undefined, "msg");
+    assert.equal(result, "");
+  });
+
+  it("only touches `to` when cc is not provided", () => {
+    const result = setRecipientsScript(["a@example.com"], null, "msg");
     assert.ok(result.includes("delete every to recipient"));
-    assert.ok(!result.includes("make new"));
+    assert.ok(!result.includes("delete every cc recipient"));
+    assert.ok(result.includes("make new to recipient"));
+    assert.ok(!result.includes("make new cc recipient"));
+  });
+
+  it("only touches `cc` when to is not provided", () => {
+    const result = setRecipientsScript(null, ["c@example.com"], "msg");
+    assert.ok(!result.includes("delete every to recipient"));
+    assert.ok(result.includes("delete every cc recipient"));
+    assert.ok(result.includes("make new cc recipient"));
+    assert.ok(!result.includes("make new to recipient"));
   });
 
   it("filters out falsy entries in arrays", () => {
