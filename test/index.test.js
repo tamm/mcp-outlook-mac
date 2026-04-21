@@ -1,5 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import path from "node:path";
+import os from "node:os";
 import {
   extractEmail,
   parseRecipients,
@@ -11,6 +13,11 @@ import {
   markdownToHtml,
   coerceEmailIds,
   setRecipientsScript,
+  diagnoseAppleScriptError,
+  uniquePath,
+  ftsStatusLine,
+  ok,
+  err,
 } from "../index.js";
 
 describe("extractEmail", () => {
@@ -360,5 +367,203 @@ describe("setRecipientsScript", () => {
   it("escapes special characters in addresses", () => {
     const result = setRecipientsScript(['o"malley@example.com'], [], "msg");
     assert.ok(result.includes('o\\"malley@example.com'));
+  });
+});
+
+describe("diagnoseAppleScriptError", () => {
+  it("detects ETIMEDOUT", () => {
+    const result = diagnoseAppleScriptError({ message: "ETIMEDOUT" });
+    assert.ok(result.includes("timed out"));
+  });
+
+  it("detects killed process", () => {
+    const result = diagnoseAppleScriptError({ message: "", killed: true });
+    assert.ok(result.includes("timed out"));
+  });
+
+  it("detects -1728 object not found", () => {
+    const result = diagnoseAppleScriptError({ message: "execution error -1728" });
+    assert.ok(result.includes("not found"));
+  });
+
+  it("detects -1712 busy dialog", () => {
+    const result = diagnoseAppleScriptError({ message: "execution error -1712" });
+    assert.ok(result.includes("dialog"));
+  });
+
+  it("detects not running / -600", () => {
+    const result = diagnoseAppleScriptError({ message: "not running" });
+    assert.ok(result.includes("not running"));
+  });
+
+  it("detects -600 error code", () => {
+    const result = diagnoseAppleScriptError({ message: "some error -600" });
+    assert.ok(result.includes("not running"));
+  });
+
+  it("detects -10810 launch failure", () => {
+    const result = diagnoseAppleScriptError({ message: "error -10810" });
+    assert.ok(result.includes("launch"));
+  });
+
+  it("extracts execution error message without a known error code", () => {
+    // Use an error code not matched by any earlier specific branch
+    const result = diagnoseAppleScriptError({ message: "execution error: Mail folder not accessible (-9999)" });
+    assert.ok(result.includes("Outlook AppleScript error"));
+    assert.ok(result.includes("Mail folder not accessible"));
+  });
+
+  it("falls back to generic message slice", () => {
+    const result = diagnoseAppleScriptError({ message: "some totally unknown error" });
+    assert.ok(result.includes("AppleScript error") || result.includes("some totally unknown error"));
+  });
+
+  it("handles missing message property", () => {
+    const result = diagnoseAppleScriptError({});
+    assert.equal(typeof result, "string");
+    assert.ok(result.length > 0);
+  });
+});
+
+describe("ftsStatusLine", () => {
+  it("returns empty message when total is 0", () => {
+    const result = ftsStatusLine({ indexed: 0, total: 0 });
+    assert.equal(result, "Index: empty");
+  });
+
+  it("returns complete message when fully indexed", () => {
+    const result = ftsStatusLine({ indexed: 1000, total: 1000 });
+    assert.ok(result.includes("complete"));
+    assert.ok(result.includes("1,000"));
+  });
+
+  it("returns percentage when partially indexed", () => {
+    const result = ftsStatusLine({ indexed: 500, total: 1000 });
+    assert.ok(result.includes("50%"));
+    assert.ok(result.includes("500"));
+    assert.ok(result.includes("1,000"));
+  });
+
+  it("rounds percentage down", () => {
+    const result = ftsStatusLine({ indexed: 1, total: 3 });
+    assert.ok(result.includes("33%"));
+  });
+});
+
+describe("ok and err response helpers", () => {
+  it("ok wraps text in content array", () => {
+    const result = ok("hello world");
+    assert.deepEqual(result, { content: [{ type: "text", text: "hello world" }] });
+  });
+
+  it("err wraps text with Error: prefix and isError flag", () => {
+    const result = err("something went wrong");
+    assert.deepEqual(result, {
+      content: [{ type: "text", text: "Error: something went wrong" }],
+      isError: true,
+    });
+  });
+
+  it("ok handles empty string", () => {
+    const result = ok("");
+    assert.equal(result.content[0].text, "");
+  });
+
+  it("err does not set isError on ok", () => {
+    const result = ok("fine");
+    assert.equal(result.isError, undefined);
+  });
+});
+
+describe("uniquePath", () => {
+  it("returns the unmodified path when no conflict", () => {
+    // Use a path that definitely does not exist
+    const dir = os.tmpdir();
+    const result = uniquePath(dir, 99999, "nonexistent-mcp-test-file.txt");
+    assert.equal(result, path.join(dir, "99999_nonexistent-mcp-test-file.txt"));
+  });
+
+  it("appends _1 when the base path already exists", () => {
+    const dir = os.tmpdir();
+    // First call returns the base path (it does not exist yet in our test)
+    const base = uniquePath(dir, 88888, "unique-test-file.txt");
+    assert.equal(base, path.join(dir, "88888_unique-test-file.txt"));
+  });
+
+  it("handles filenames with extensions correctly", () => {
+    const dir = os.tmpdir();
+    const result = uniquePath(dir, 12345, "report.pdf");
+    assert.ok(result.includes("12345_report"));
+    assert.ok(result.endsWith(".pdf"));
+  });
+
+  it("handles filenames without extensions", () => {
+    const dir = os.tmpdir();
+    const result = uniquePath(dir, 12345, "noextension");
+    assert.ok(result.includes("12345_noextension"));
+  });
+});
+
+describe("stripSignature — additional patterns", () => {
+  it("strips Sent from my Galaxy", () => {
+    const input = "Message body\n\nSent from my Galaxy";
+    assert.equal(stripSignature(input), "Message body");
+  });
+
+  it("strips Get Outlook for Android", () => {
+    const input = "Body text\n\nGet Outlook for Android";
+    assert.equal(stripSignature(input), "Body text");
+  });
+
+  it("strips Sent from Mail for Windows", () => {
+    const input = "Body text\n\nSent from Mail for Windows";
+    assert.equal(stripSignature(input), "Body text");
+  });
+
+  it("preserves body when -- delimiter has no trailing space", () => {
+    // '--' without trailing space is NOT the sig delimiter — should be preserved
+    const input = "Hello\n--\nNot a sig";
+    assert.ok(stripSignature(input).includes("Not a sig"));
+  });
+});
+
+describe("stripQuotedReplies — additional patterns", () => {
+  it("strips multi-line On ... wrote block", () => {
+    const input = "My message\n\nOn Tuesday, 15 April 2026 at 9:00 AM, John Smith <john@example.com> wrote:\n> quoted";
+    assert.equal(stripQuotedReplies(input), "My message");
+  });
+
+  it("handles text with leading > lines only (no body)", () => {
+    const input = "> all quoted\n> more quoted";
+    // All lines are quoted — result should be empty or just whitespace
+    const result = stripQuotedReplies(input);
+    assert.equal(result.trim(), "");
+  });
+
+  it("preserves > characters mid-body that are not quote lines", () => {
+    const input = "Prices went up > 10% this year\nThat's significant.";
+    const result = stripQuotedReplies(input);
+    assert.ok(result.includes("10%"));
+  });
+});
+
+describe("parseRecipients — edge cases", () => {
+  it("handles array with Name <email> format", () => {
+    assert.deepEqual(
+      parseRecipients(["Alice Smith <alice@example.com>"]),
+      ["alice@example.com"]
+    );
+  });
+
+  it("handles whitespace-only string", () => {
+    assert.deepEqual(parseRecipients("   "), []);
+  });
+
+  it("handles mixed comma and semicolon separators", () => {
+    const result = parseRecipients("a@example.com, b@example.com; c@example.com");
+    assert.equal(result.length, 3);
+    assert.ok(result.includes("a@example.com"));
+    assert.ok(result.includes("b@example.com"));
+    assert.ok(result.includes("c@example.com"));
   });
 });

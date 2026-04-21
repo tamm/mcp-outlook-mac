@@ -943,78 +943,68 @@ end tell`;
     }
   }
 
-  // Try RTF injection first — open window, then inject body
-  if (body.trim()) {
-    let tmpPath = null;
-    let windowOpened = false;
-    try {
-      const rtf = setRtfBody(htmlBody, "composeMsg");
-      tmpPath = rtf.tmpPath;
-      // Open the reply window first
-      const openScript = `
+  // Step 1: open the reply/forward window and capture the new message's id.
+  // Targeting by id avoids the `message of front window` race entirely —
+  // Outlook has a number of visible=false phantom windows (Contact Suggestions
+  // autocomplete popups, stale inspectors) that compete for "front window".
+  const openScript = `
 tell application "Microsoft Outlook"
     activate
 ${findMessageScript(emailId)}
+    if targetMsg is missing value then return "NOT_FOUND"
     set composeMsg to ${action} with opening window
+    return (id of composeMsg) as string
 end tell`;
-      runAppleScriptHeredoc(openScript);
-      windowOpened = true;
-      // Wait for the compose window to fully initialize
-      execSync("sleep 1", { shell: "/bin/bash" });
-      // Inject RTF and fix recipients on the already-open window
-      const recipientFix = recipientOverride
-        ? `\n    ${setRecipientsScript(recipientOverride.to, recipientOverride.cc, "composeMsg")}`
-        : "";
+  const composeIdRaw = runAppleScriptHeredoc(openScript);
+  if (composeIdRaw === "NOT_FOUND") return err(`Email ${emailId} not found.`);
+  const composeId = Number(composeIdRaw);
+  if (!Number.isFinite(composeId) || composeId <= 0) {
+    return err(`Failed to open ${mode} window for email ${emailId}: got ${composeIdRaw}`);
+  }
+
+  // Step 2: inject body + recipient overrides by targeting the draft by id.
+  const recipientFix = recipientOverride
+    ? `\n    ${setRecipientsScript(recipientOverride.to, recipientOverride.cc, "composeMsg")}`
+    : "";
+
+  if (body.trim()) {
+    let tmpPath = null;
+    try {
+      const rtf = setRtfBody(htmlBody, "composeMsg");
+      tmpPath = rtf.tmpPath;
       const injectScript = `
 tell application "Microsoft Outlook"
-    set composeMsg to message of front window
+    set composeMsg to message id ${composeId}
     ${rtf.snippet}${recipientFix}
 end tell`;
       const result = runAppleScriptHeredoc(injectScript);
       if (result && result.startsWith("Error:")) return err(result.slice(7));
       return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
     } catch (rtfErr) {
-      console.error(`RTF injection failed (windowOpened=${windowOpened}), falling back to clipboard paste: ${rtfErr.message}`);
-      // If window already opened, paste into it — don't open another
-      if (windowOpened) {
-        if (body.trim()) pasteViaClipboard(htmlBody);
-        const result = runAppleScriptHeredoc(pasteIntoFrontWindow());
-        if (result && result.startsWith("Error:")) return err(result.slice(7));
-        // Fix recipients even in fallback path
-        if (recipientOverride) {
-          const fixScript = `
+      console.error(`[compose] RTF injection failed for draft ${composeId}, falling back to clipboard paste: ${rtfErr.message}`);
+      pasteViaClipboard(htmlBody);
+      const fallbackScript = `
 tell application "Microsoft Outlook"
-    set composeMsg to message of front window
-    ${setRecipientsScript(recipientOverride.to, recipientOverride.cc, "composeMsg")}
-end tell`;
-          try { runAppleScriptHeredoc(fixScript); } catch {}
-        }
-        return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
-      }
+    set composeMsg to message id ${composeId}${recipientFix}
+end tell
+${pasteIntoFrontWindow()}`;
+      const result = runAppleScriptHeredoc(fallbackScript);
+      if (result && result.startsWith("Error:")) return err(result.slice(7));
+      return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
     } finally {
       if (tmpPath) try { fs.unlinkSync(tmpPath); } catch {}
     }
   }
 
-  // Fallback: no window open yet — open it and clipboard paste
-  if (body.trim()) pasteViaClipboard(htmlBody);
-
-  const recipientFix = recipientOverride
-    ? `\n    set composeMsg to message of front window\n    ${setRecipientsScript(recipientOverride.to, recipientOverride.cc, "composeMsg")}`
-    : "";
-  const pasteScript = `
+  // No body: just apply recipient overrides if any.
+  if (recipientOverride) {
+    const fixScript = `
 tell application "Microsoft Outlook"
-    activate
-${findMessageScript(emailId)}
-    ${action} with opening window
-end tell
-delay 1${recipientFix ? `
-tell application "Microsoft Outlook"${recipientFix}
-end tell` : ""}
-${body.trim() ? pasteIntoFrontWindow() : ""}`;
-
-  const result = runAppleScriptHeredoc(pasteScript);
-  if (result && result.startsWith("Error:")) return err(result.slice(7));
+    set composeMsg to message id ${composeId}${recipientFix}
+end tell`;
+    const result = runAppleScriptHeredoc(fixScript);
+    if (result && result.startsWith("Error:")) return err(result.slice(7));
+  }
   return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
 }
 
@@ -1300,4 +1290,9 @@ export {
   markdownToHtml,
   coerceEmailIds,
   setRecipientsScript,
+  diagnoseAppleScriptError,
+  uniquePath,
+  ftsStatusLine,
+  ok,
+  err,
 };
