@@ -54,14 +54,15 @@ See `SPEC.md` for the full list and semantics. Quick summary:
 | Tool | Purpose |
 |------|---------|
 | `list_folders` | All mail folders with counts |
-| `search_emails` | List/filter inbox emails (biases toward full view — narrow only when needed) |
-| `search_body` | Full-text body search (FTS5, BM25) |
+| `search_emails` | The one search tool — subject, sender, recipients (To/CC) and body across ALL folders incl. Sent. Trigram substring + fuzzy, exact ranked first, multi-word decomposed. Just pass a query. |
 | `get_email` | Full content by ID (strips signatures and quotes by default) |
 | `compose` | Draft new / reply / forward — body is markdown |
 | `move_email` | Move to any folder |
 | `archive_emails` | Batch archive (move to Archive) |
 | `download_attachment` | Save attachment(s) to disk |
-| `index_now` | Force an immediate FTS index pass |
+| `index_now` | Force an immediate search-index pass |
+
+Also usable as a CLI: `mcp-outlook search 'tamm@'`, `mcp-outlook index`, `mcp-outlook folders`, `mcp-outlook get <id>`.
 
 ## Layout
 

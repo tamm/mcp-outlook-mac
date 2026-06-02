@@ -1,10 +1,13 @@
+#!/usr/bin/env node
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { execSync } from "child_process";
+import { execSync, execFileSync } from "child_process";
+import { realpathSync } from "fs";
+import { fileURLToPath } from "url";
 import { marked } from "marked";
 import fs from "fs";
 import os from "os";
@@ -72,11 +75,11 @@ const DB_PATH = path.join(
 function runSqlite(query) {
   const flat = query.replace(/\s+/g, " ").trim();
   try {
-    const result = execSync(`sqlite3 -json ${JSON.stringify(DB_PATH)} ${JSON.stringify(flat)}`, {
+    // execFileSync passes args directly to sqlite3 with no shell — no quoting/injection risk.
+    const result = execFileSync("sqlite3", ["-json", DB_PATH, flat], {
       encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024,
+      maxBuffer: 64 * 1024 * 1024,
       timeout: 15000,
-      shell: "/bin/bash",
     });
     const trimmed = result.trim();
     if (!trimmed) return [];
@@ -287,27 +290,34 @@ function recipientLines(addresses, type, msgVar) {
   ).join("\n    ");
 }
 
-// --- Resolve folder IDs for queries ---
+// --- Query helpers ---
 
-function resolveFolder(folderName) {
-  const rows = runSqlite(
-    `SELECT Record_RecordID FROM Folders WHERE Folder_Name = ${JSON.stringify(folderName)}
-     ORDER BY (SELECT COUNT(*) FROM Mail m WHERE m.Record_FolderID = Record_RecordID) DESC LIMIT 1`
-  );
-  if (!rows || rows.length === 0) return null;
-  return rows[0].Record_RecordID;
+// Split a multi-word query into individual terms (strips punctuation, dedupes, ignores short words)
+function queryTerms(query) {
+  return [...new Set(
+    query.toLowerCase().split(/[\s,;|&()"']+/).filter(t => t.length > 2)
+  )];
 }
 
-function resolveInboxIds() {
-  const rows = runSqlite(`SELECT Record_RecordID FROM Folders WHERE Folder_Name = 'Inbox'`);
-  if (!rows || rows.length === 0) return null;
-  return rows.map(r => r.Record_RecordID);
+// For each term, also search its alphanumeric core (leading/trailing punctuation stripped).
+// This is what makes 'tamm@' fuzzy-match '@tamm': the literal 'tamm@' matches only exact substrings,
+// while the core 'tamm' surfaces near-matches like '@tamm'. Exact substrings still rank higher
+// (via exact_hit), so cores only add lower-ranked fuzzy candidates. Cores ≤2 chars are dropped.
+function expandTerms(terms) {
+  const out = [];
+  for (const t of terms) {
+    out.push(t);
+    const core = t.replace(/^[^a-z0-9]+/i, "").replace(/[^a-z0-9]+$/i, "");
+    if (core && core !== t && core.length > 2) out.push(core);
+  }
+  return [...new Set(out)];
 }
 
 // --- FTS5 body search index ---
 
-const FTS_DIR = path.join(os.homedir(), ".mcp-outlook-mac");
-const FTS_DB = path.join(FTS_DIR, "body-index.db");
+// FTS index location. Override with MCP_OUTLOOK_FTS_DB (used by tests + isolated CLI runs).
+const FTS_DB = process.env.MCP_OUTLOOK_FTS_DB || path.join(os.homedir(), ".mcp-outlook-mac", "body-index.db");
+const FTS_DIR = path.dirname(FTS_DB);
 const INDEX_BATCH_SIZE = 10000;
 const INDEX_REFRESH_INTERVAL_MS = 60 * 1000;
 let indexRefreshRunning = false;
@@ -316,14 +326,12 @@ let indexRefreshTimer = null;
 function runFts(query, options = {}) {
   const q = query.replace(/\s+/g, " ").trim();
   try {
-    return execSync(
-      `sqlite3 ${JSON.stringify(FTS_DB)} ${JSON.stringify(q)}`,
-      {
-        encoding: "utf-8",
-        maxBuffer: 10 * 1024 * 1024,
-        timeout: options.timeout || 10000,
-      }
-    ).trim();
+    // execFileSync: no shell, query passed as a literal arg — safe for arbitrary user text.
+    return execFileSync("sqlite3", [FTS_DB, q], {
+      encoding: "utf-8",
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: options.timeout || 10000,
+    }).trim();
   } catch (error) {
     throw new Error(`FTS error: ${(error.message || "").slice(0, 200)}`);
   }
@@ -332,36 +340,104 @@ function runFts(query, options = {}) {
 function parseFts(query) {
   const q = query.replace(/\s+/g, " ").trim();
   try {
-    const raw = execSync(
-      `sqlite3 -json ${JSON.stringify(FTS_DB)} ${JSON.stringify(q)}`,
-      { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 10000 }
-    ).trim();
+    const raw = execFileSync("sqlite3", ["-json", FTS_DB, q], {
+      encoding: "utf-8", maxBuffer: 64 * 1024 * 1024, timeout: 10000,
+    }).trim();
     if (!raw) return [];
     return JSON.parse(raw);
   } catch { return []; }
 }
 
+// Bump this whenever the FTS/bodies schema changes — forces a one-time rebuild.
+const FTS_SCHEMA_VERSION = 2;
+
+// All FTS-indexed text columns, in order — used for bm25 weights and trigger column lists.
+const FTS_COLUMNS = ["subject", "sender_name", "sender_addr", "to_addr", "cc_addr", "body"];
+
+let ftsReady = false;
+
 function ensureFtsDb() {
+  if (ftsReady) return;
   if (!fs.existsSync(FTS_DIR)) fs.mkdirSync(FTS_DIR, { recursive: true });
+
+  const current = Number(runFts(`PRAGMA user_version`)) || 0;
+  if (current < FTS_SCHEMA_VERSION) {
+    migrateFtsDb();
+  } else {
+    createFtsSchema();
+  }
+  ftsReady = true;
+}
+
+function createFtsSchema() {
+  // indexed: tracks which Outlook message IDs have been synced (and at what ts).
   runFts(`CREATE TABLE IF NOT EXISTS indexed (id INTEGER PRIMARY KEY, ts INTEGER)`);
-  runFts(`CREATE TABLE IF NOT EXISTS bodies (id INTEGER PRIMARY KEY, subject TEXT, sender TEXT, body TEXT)`);
-  runFts(`CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(subject, sender, body, content='bodies', content_rowid='id')`);
-  runFts(`CREATE TRIGGER IF NOT EXISTS bodies_ai AFTER INSERT ON bodies BEGIN INSERT INTO fts(rowid, subject, sender, body) VALUES (new.id, new.subject, new.sender, new.body); END`);
-  runFts(`CREATE TRIGGER IF NOT EXISTS bodies_ad AFTER DELETE ON bodies BEGIN INSERT INTO fts(fts, rowid, subject, sender, body) VALUES ('delete', old.id, old.subject, old.sender, old.body); END`);
+  // bodies: the searchable content + stored metadata for rendering/filtering without an Outlook round-trip.
+  runFts(`CREATE TABLE IF NOT EXISTS bodies (
+    id INTEGER PRIMARY KEY,
+    subject TEXT, sender_name TEXT, sender_addr TEXT,
+    to_addr TEXT, cc_addr TEXT, body TEXT,
+    folder TEXT, account TEXT, ts INTEGER, read_flag INTEGER, has_attach INTEGER
+  )`);
+  // External-content trigram FTS over every searchable text column.
+  runFts(`CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
+    ${FTS_COLUMNS.join(", ")},
+    content='bodies', content_rowid='id', tokenize='trigram'
+  )`);
+  const cols = FTS_COLUMNS.join(", ");
+  const newCols = FTS_COLUMNS.map(c => `new.${c}`).join(", ");
+  const oldCols = FTS_COLUMNS.map(c => `old.${c}`).join(", ");
+  runFts(`CREATE TRIGGER IF NOT EXISTS bodies_ai AFTER INSERT ON bodies BEGIN
+    INSERT INTO fts(rowid, ${cols}) VALUES (new.id, ${newCols}); END`);
+  runFts(`CREATE TRIGGER IF NOT EXISTS bodies_ad AFTER DELETE ON bodies BEGIN
+    INSERT INTO fts(fts, rowid, ${cols}) VALUES ('delete', old.id, ${oldCols}); END`);
+  // External-content FTS5 silently desyncs on a plain UPDATE without this trigger.
+  runFts(`CREATE TRIGGER IF NOT EXISTS bodies_au AFTER UPDATE ON bodies BEGIN
+    INSERT INTO fts(fts, rowid, ${cols}) VALUES ('delete', old.id, ${oldCols});
+    INSERT INTO fts(rowid, ${cols}) VALUES (new.id, ${newCols}); END`);
+}
+
+// Drop everything and rebuild cleanly. user_version is set LAST so a crash mid-migration re-runs.
+function migrateFtsDb() {
+  runFts(`DROP TRIGGER IF EXISTS bodies_ai`);
+  runFts(`DROP TRIGGER IF EXISTS bodies_ad`);
+  runFts(`DROP TRIGGER IF EXISTS bodies_au`);
+  runFts(`DROP TABLE IF EXISTS fts`);   // virtual table before its content table
+  runFts(`DROP TABLE IF EXISTS bodies`);
+  runFts(`CREATE TABLE IF NOT EXISTS indexed (id INTEGER PRIMARY KEY, ts INTEGER)`);
+  runFts(`DELETE FROM indexed`);        // force a full re-sync into the new schema
+  createFtsSchema();
+  runFts(`PRAGMA user_version = ${FTS_SCHEMA_VERSION}`);
 }
 
 function isIndexed(emailId) {
   return parseFts(`SELECT 1 FROM indexed WHERE id = ${Number(emailId)} LIMIT 1`).length > 0;
 }
 
+// Single-quote escape for embedding in an FTS SQL string literal.
+function sqlLit(s) {
+  return (s || "").replace(/'/g, "''");
+}
+
+// Called from get_email: upgrade an existing row's body to FULL text (bulk sync only has the preview).
+// Safe to UPDATE because bodies_au keeps the FTS index in sync. Creates the row if it doesn't exist yet.
 function indexEmail(emailId, subject, sender, bodyText) {
   const id = Number(emailId);
-  if (isIndexed(id)) return;
-  const body = (bodyText || "").slice(0, 50000).replace(/'/g, "''");
-  const subj = (subject || "").replace(/'/g, "''");
-  const from = (sender || "").replace(/'/g, "''");
+  if (!Number.isFinite(id)) return;
+  const body = sqlLit((bodyText || "").slice(0, 50000));
+  const subj = sqlLit(subject);
+  const from = sqlLit(sender);
   try {
-    runFts(`INSERT OR REPLACE INTO bodies (id, subject, sender, body) VALUES (${id}, '${subj}', '${from}', '${body}')`);
+    const exists = parseFts(`SELECT 1 FROM bodies WHERE id = ${id} LIMIT 1`).length > 0;
+    if (exists) {
+      // Upgrade body to full text; refresh subject/sender if we have them.
+      runFts(`UPDATE bodies SET body = '${body}'
+              ${subject ? `, subject = '${subj}'` : ""}
+              ${sender ? `, sender_name = '${from}'` : ""}
+              WHERE id = ${id}`);
+    } else {
+      runFts(`INSERT OR REPLACE INTO bodies (id, subject, sender_name, body) VALUES (${id}, '${subj}', '${from}', '${body}')`);
+    }
     runFts(`INSERT OR REPLACE INTO indexed (id, ts) VALUES (${id}, ${Math.floor(Date.now() / 1000)})`);
   } catch {}
 }
@@ -384,17 +460,28 @@ function syncFtsIndex(options = {}) {
       SELECT
         m.Record_RecordID AS id,
         COALESCE(m.Message_NormalizedSubject, '') AS subject,
-        COALESCE(m.Message_SenderList, '') AS sender,
-        COALESCE(m.Message_Preview, '') AS body
+        COALESCE(m.Message_SenderList, '') AS sender_name,
+        COALESCE(m.Message_SenderAddressList, '') AS sender_addr,
+        COALESCE(m.Message_ToRecipientAddressList, '') AS to_addr,
+        COALESCE(m.Message_CCRecipientAddressList, '') AS cc_addr,
+        COALESCE(m.Message_Preview, '') AS body,
+        COALESCE(f.Folder_Name, '') AS folder,
+        COALESCE(ae.Account_Name, am.Account_Name, 'Local') AS account,
+        m.Message_TimeReceived AS ts,
+        COALESCE(m.Message_ReadFlag, 0) AS read_flag,
+        COALESCE(m.Message_HasAttachment, 0) AS has_attach
       FROM outlook.Mail m
+      LEFT JOIN outlook.Folders f ON f.Record_RecordID = m.Record_FolderID
+      LEFT JOIN outlook.AccountsExchange ae ON ae.Record_RecordID = (f.Record_AccountUID & 0xFFFFFFFF)
+      LEFT JOIN outlook.AccountsMail am ON am.Record_RecordID = (f.Record_AccountUID & 0xFFFFFFFF)
       LEFT JOIN indexed i ON i.id = m.Record_RecordID
       LEFT JOIN bodies b ON b.id = m.Record_RecordID
       WHERE i.id IS NULL OR b.id IS NULL
       ORDER BY m.Record_RecordID
       LIMIT ${batchSize};
       BEGIN;
-      INSERT OR IGNORE INTO bodies (id, subject, sender, body)
-      SELECT id, subject, sender, body FROM batch_rows;
+      INSERT OR IGNORE INTO bodies (id, subject, sender_name, sender_addr, to_addr, cc_addr, body, folder, account, ts, read_flag, has_attach)
+      SELECT id, subject, sender_name, sender_addr, to_addr, cc_addr, body, folder, account, ts, read_flag, has_attach FROM batch_rows;
       INSERT OR IGNORE INTO indexed (id, ts)
       SELECT id, strftime('%s', 'now') FROM batch_rows;
       COMMIT;
@@ -439,21 +526,19 @@ function startIndexRefreshLoop() {
 }
 
 function ftsIndexStats() {
-  try {
-    const indexed = parseFts(`SELECT COUNT(*) as n FROM indexed`);
-    const total = runSqlite(`SELECT COUNT(*) as n FROM Mail`);
-    return {
-      indexed: indexed[0]?.n || 0,
-      total: total[0]?.n || 0,
-    };
-  } catch {
-    return { indexed: 0, total: 0 };
-  }
+  // Indexed count comes from the local FTS db (always available).
+  let indexed = 0;
+  try { indexed = parseFts(`SELECT COUNT(*) as n FROM bodies`)[0]?.n || 0; } catch {}
+  // Total comes from Outlook — best effort; 0 if Outlook is unreachable.
+  let total = 0;
+  try { total = runSqlite(`SELECT COUNT(*) as n FROM Mail`)[0]?.n || 0; } catch {}
+  return { indexed, total };
 }
 
 function ftsStatusLine(stats) {
   const { indexed, total } = stats;
-  if (!total) return "Index: empty";
+  if (!indexed && !total) return "Index: empty";
+  if (!total) return `Index: ${indexed.toLocaleString()} emails indexed`;
   const pct = Math.round((indexed / total) * 100);
   if (pct >= 100) return `Index: complete (${indexed.toLocaleString()} emails)`;
   return `Index: ${pct}% — ${indexed.toLocaleString()}/${total.toLocaleString()} indexed`;
@@ -469,18 +554,17 @@ const TOOLS = [
   },
   {
     name: "search_emails",
-    description: "List inbox emails matching optional filters. Omit all filters to return the full inbox (newest first). Bias toward unbounded scope — only narrow when the task actually requires it. Good for triage, where missing older unread items is worse than a larger result set.",
+    description: "Search email. This is the ONLY search tool — it searches EVERYTHING for each message: subject, sender name, sender address, To, CC, and body — across ALL folders including Sent, and all accounts, by default. Just pass a natural query; partial words, substrings and fuzzy matches are found and ranked automatically, with exact matches first. e.g. query 'tamm@' returns every email to/from/mentioning that address (and surfaces '@tamm'-style near-matches, ranked lower). Multi-word queries are decomposed and ranked by how many parts match, so you never get a bare zero when only part matches. Do NOT pass folder/limit/date filters unless you specifically must narrow — the defaults are right for almost every task.",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Optional substring match on subject or sender. Omit to match all emails." },
-        folder: { type: "string", description: "Optional folder name. Omit to search all Inboxes." },
-        account: { type: "string", description: "Optional account name. Omit to search all accounts." },
-        limit: { type: "number", description: "Optional max results (hard cap 1000). Omit to return up to 500 — prefer omitting for triage so older items are not missed." },
-        unread_only: { type: "boolean", description: "Only unread emails." },
-        sort: { type: "string", enum: ["desc", "asc"], description: "Sort by date (default: desc)." },
-        after: { type: "string", description: "Optional date lower bound (YYYY-MM-DD). Only use when you specifically need to bound by date. Omit to search regardless of date." },
-        before: { type: "string", description: "Optional date upper bound (YYYY-MM-DD). Only use when you specifically need to bound by date. Omit to search regardless of date." },
+        query: { type: "string", description: "What to find — matched against subject, sender, To, CC and body. Substrings/fuzzy/multi-word all handled. Omit to list newest emails." },
+        folder: { type: "string", description: "Restrict to one folder (e.g. 'Sent', 'Archive'). OMIT to search all folders — almost always correct." },
+        account: { type: "string", description: "Restrict to one account. OMIT to search all accounts." },
+        limit: { type: "number", description: "Max results (default 500, cap 1000). OMIT — the default is right for most tasks." },
+        unread_only: { type: "boolean", description: "Only unread emails. OMIT unless you specifically want unread-only." },
+        after: { type: "string", description: "Date lower bound (YYYY-MM-DD). OMIT unless a date range is specifically required." },
+        before: { type: "string", description: "Date upper bound (YYYY-MM-DD). OMIT unless a date range is specifically required." },
       },
     },
   },
@@ -554,20 +638,8 @@ const TOOLS = [
     },
   },
   {
-    name: "search_body",
-    description: "Full-text body search across all indexed emails (FTS5, BM25-ranked). Index refreshes in the background. Bias toward unbounded scope — only narrow limit when the task actually requires it.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: { type: "string", description: "Search terms." },
-        limit: { type: "number", description: "Optional max results (hard cap 1000). Omit to return up to 500." },
-      },
-      required: ["query"],
-    },
-  },
-  {
     name: "index_now",
-    description: "Build or catch up the full FTS5 index immediately.",
+    description: "Build or catch up the search index immediately (subject/sender/recipients/preview for all mail; full body for opened emails). search_emails refreshes the index in the background, so you rarely need this — use it after a large mailbox change or if search reports the index is incomplete.",
     inputSchema: { type: "object", properties: {} },
   },
 ];
@@ -583,13 +655,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     let result;
     switch (name) {
       case "list_folders": result = handleListFolders(args); break;
-      case "search_emails": result = handleSearchEmails(args); break;
+      case "search_emails": result = handleSearch(args); break;
       case "get_email": result = handleGetEmail(args); break;
       case "compose": result = handleCompose(args); break;
       case "move_email": result = handleMoveEmail(args); break;
       case "archive_emails": result = handleArchiveEmails(args); break;
       case "download_attachment": result = handleDownloadAttachment(args); break;
-      case "search_body": result = handleSearchBody(args); break;
       case "index_now": result = handleIndexNow(args); break;
       default: return err(`Unknown tool: ${name}`);
     }
@@ -619,91 +690,140 @@ function handleListFolders() {
   return ok(lines.join("\n"));
 }
 
-// --- Handler: search_emails ---
+// --- Unified search (one tool, every field, trigram fuzzy + exact ranking) ---
 
-function handleSearchEmails(args) {
-  const query = args?.query || null;
-  const folderName = args?.folder || null;
-  const accountName = args?.account || null;
-  const limit = Math.min(args?.limit || 500, 1000);
-  const sortDir = args?.sort === "asc" ? "ASC" : "DESC";
+// bm25 column weights, in FTS_COLUMNS order: subject, sender_name, sender_addr, to_addr, cc_addr, body.
+// Sender/recipients/subject are weighted above body (which is preview-only in bulk).
+const BM25_WEIGHTS = [8, 10, 10, 9, 9, 2];
+const MAX_QUERY_TERMS = 6; // cap the per-term UNION to keep the query bounded
 
-  // Resolve folder filter
-  let folderClause;
-  let folderLabel;
-  if (folderName) {
-    const folderId = resolveFolder(folderName);
-    if (!folderId) return err(`Folder '${folderName}' not found.`);
-    folderClause = `m.Record_FolderID = ${folderId}`;
-    folderLabel = folderName;
-  } else {
-    const inboxIds = resolveInboxIds();
-    if (!inboxIds) return err("No Inbox folders found.");
-    folderClause = `m.Record_FolderID IN (${inboxIds.join(",")})`;
-    folderLabel = "All Inboxes";
-  }
+// Turn a raw term into an FTS5 string token: double internal quotes, wrap in quotes,
+// then escape for the surrounding SQL string literal. Disables FTS operators (OR/AND/*/parens).
+function ftsToken(term) {
+  const ftsQuoted = `"${term.replace(/"/g, '""')}"`;
+  return sqlLit(ftsQuoted);
+}
 
-  // Account filter
-  let accountClause = "";
-  if (accountName) {
-    accountClause = `AND (ae.Account_Name = ${JSON.stringify(accountName)} OR am.Account_Name = ${JSON.stringify(accountName)})`;
-  }
+// LIKE pattern for exact-substring detection, escaped for a SQL string literal.
+// Escapes LIKE wildcards so a literal % or _ in the query stays literal (ESCAPE '\').
+function likePattern(query) {
+  const esc = query.replace(/[%_\\]/g, c => "\\" + c);
+  return sqlLit(`%${esc}%`);
+}
 
-  // Search filter
-  let searchClause = "";
-  if (query) {
-    const escaped = query.replace(/'/g, "''");
-    searchClause = `AND (m.Message_NormalizedSubject LIKE '%${escaped}%' OR m.Message_SenderList LIKE '%${escaped}%')`;
-  }
-
-  // Unread filter
-  const unreadClause = args?.unread_only ? "AND m.Message_ReadFlag = 0" : "";
-
-  // Date filters (Outlook stores Message_TimeReceived as Unix timestamp)
-  let dateClause = "";
+// Build WHERE fragments for the optional filters, operating on stored bodies columns.
+function buildFilterClause(args) {
+  const parts = [];
+  if (args?.folder) parts.push(`b.folder = '${sqlLit(args.folder)}'`);
+  if (args?.account) parts.push(`b.account = '${sqlLit(args.account)}'`);
+  if (args?.unread_only) parts.push(`b.read_flag = 0`);
   if (args?.after) {
     const ts = Math.floor(new Date(args.after).getTime() / 1000);
-    if (!isNaN(ts)) dateClause += ` AND m.Message_TimeReceived >= ${ts}`;
+    if (!isNaN(ts)) parts.push(`b.ts >= ${ts}`);
   }
   if (args?.before) {
     const ts = Math.floor(new Date(args.before + "T23:59:59").getTime() / 1000);
-    if (!isNaN(ts)) dateClause += ` AND m.Message_TimeReceived <= ${ts}`;
+    if (!isNaN(ts)) parts.push(`b.ts <= ${ts}`);
   }
+  return parts.length ? "AND " + parts.join(" AND ") : "";
+}
 
-  const emails = runSqlite(`
-    SELECT m.Record_RecordID, m.Message_NormalizedSubject, m.Message_SenderList,
-           m.Message_TimeReceived, m.Message_HasAttachment,
-           m.Message_ReadFlag, m.Record_FlagStatus,
-           f.Folder_Name,
-           COALESCE(ae.Account_Name, am.Account_Name, 'Local') AS AccountName
-    FROM Mail m
-    JOIN Folders f ON f.Record_RecordID = m.Record_FolderID
-    LEFT JOIN AccountsExchange ae ON ae.Record_RecordID = (f.Record_AccountUID & 0xFFFFFFFF)
-    LEFT JOIN AccountsMail am ON am.Record_RecordID = (f.Record_AccountUID & 0xFFFFFFFF)
-    WHERE ${folderClause}
-      ${accountClause}
-      ${searchClause}
-      ${unreadClause}
-      ${dateClause}
-    ORDER BY m.Message_TimeReceived ${sortDir}
-    LIMIT ${limit}
-  `);
+const TEXT_COLS = ["subject", "sender_name", "sender_addr", "to_addr", "cc_addr", "body"];
 
-  if (!emails || emails.length === 0) {
-    return ok(query ? `No emails matching "${query}" in ${folderLabel}.` : `No emails in ${folderLabel}.`);
-  }
+// exact_hit: 1 if the full query appears as a literal substring in any column.
+function exactHitExpr(query) {
+  const pat = likePattern(query);
+  return "(" + TEXT_COLS.map(c => `b.${c} LIKE '${pat}' ESCAPE '\\'`).join(" OR ") + ")";
+}
 
-  const lines = emails.map((msg) => {
-    const date = msg.Message_TimeReceived
-      ? new Date(msg.Message_TimeReceived * 1000).toISOString().slice(0, 10)
-      : "";
-    const from = msg.Message_SenderList || "";
-    const account = msg.AccountName ? `${msg.AccountName}/` : "";
-    const unread = msg.Message_ReadFlag ? " " : "●";
-    const flagged = msg.Record_FlagStatus ? "⚑ " : "";
-    const attach = msg.Message_HasAttachment ? " 📎" : "";
-    return `ID:${msg.Record_RecordID} | ${unread} ${flagged}${date} | ${from} | ${msg.Message_NormalizedSubject || "(no subject)"}${attach} [${account}${msg.Folder_Name}]`;
+function rowSelectCols() {
+  // Pull everything needed to render + rank, no Outlook round-trip.
+  return `b.id, b.subject, b.sender_name, b.sender_addr, b.folder, b.account,
+          b.ts, b.read_flag, b.has_attach`;
+}
+
+function formatSearchRows(rows) {
+  return rows.map(r => {
+    const date = r.ts ? new Date(r.ts * 1000).toISOString().slice(0, 10) : "";
+    const from = r.sender_name || r.sender_addr || "";
+    const account = r.account ? `${r.account}/` : "";
+    const unread = r.read_flag ? " " : "●";
+    const attach = r.has_attach ? " 📎" : "";
+    const snippet = (r.snippet || "").replace(/\s+/g, " ").trim();
+    const tail = snippet ? `\n  ${snippet}` : "";
+    return `ID:${r.id} | ${unread} ${date} | ${from} | ${r.subject || "(no subject)"}${attach} [${account}${r.folder || ""}]${tail}`;
   });
+}
+
+function handleSearch(args) {
+  ensureFtsDb();
+  const query = (args?.query || "").trim();
+  const limit = Math.min(Math.max(Number(args?.limit) || 500, 1), 1000);
+  const filterClause = buildFilterClause(args);
+
+  // No query → list newest emails (optionally filtered).
+  if (!query) {
+    const rows = parseFts(`
+      SELECT ${rowSelectCols()}, '' AS snippet FROM bodies b
+      WHERE 1=1 ${filterClause}
+      ORDER BY b.ts DESC LIMIT ${limit}`);
+    if (!rows.length) return ok(`No emails. ${ftsStatusLine(ftsIndexStats())}`);
+    return ok(formatSearchRows(rows).join("\n") + `\n\n${ftsStatusLine(ftsIndexStats())}`);
+  }
+
+  const exact = exactHitExpr(query);
+  const terms = expandTerms(queryTerms(query)).slice(0, MAX_QUERY_TERMS);
+
+  let rows;
+  if (terms.length === 0) {
+    // Query too short for trigram (all tokens ≤2 chars) — LIKE-only path.
+    rows = parseFts(`
+      SELECT ${rowSelectCols()}, ${exact} AS exact_hit, '' AS snippet
+      FROM bodies b
+      WHERE ${exact} ${filterClause}
+      ORDER BY b.ts DESC
+      LIMIT ${limit}`);
+  } else {
+    // Per-term UNION ALL → GROUP BY: terms_matched + best bm25, then tier by exact_hit.
+    const perTerm = terms.map(t =>
+      `SELECT rowid AS id, bm25(fts, ${BM25_WEIGHTS.join(", ")}) AS bm FROM fts WHERE fts MATCH '${ftsToken(t)}'`
+    ).join("\n      UNION ALL\n      ");
+
+    // Snippet via a correlated subquery so it NEVER filters the result set (a JOIN on one term
+    // would drop rows that matched only the other terms). Matches the body column on the first term.
+    const snipSub = `(SELECT snippet(fts, 5, '>>>', '<<<', '...', 12) FROM fts
+                      WHERE fts.rowid = b.id AND fts MATCH '${ftsToken(terms[0])}')`;
+
+    // MATERIALIZED is required: bm25() is an FTS5 auxiliary function that must be evaluated in the
+    // same query as its MATCH. Without it, SQLite inlines per_term into the aggregating query and
+    // errors with "unable to use function bm25 in the requested context".
+    rows = parseFts(`
+      WITH per_term AS MATERIALIZED (
+        ${perTerm}
+      ),
+      agg AS (
+        SELECT id, COUNT(*) AS terms_matched, MIN(bm) AS best_bm
+        FROM per_term GROUP BY id
+      )
+      SELECT ${rowSelectCols()},
+             ${exact} AS exact_hit,
+             a.terms_matched,
+             COALESCE(${snipSub}, '') AS snippet
+      FROM agg a
+      JOIN bodies b ON b.id = a.id
+      WHERE 1=1 ${filterClause}
+      ORDER BY exact_hit DESC, a.terms_matched DESC, a.best_bm ASC, b.ts DESC
+      LIMIT ${limit}`);
+  }
+
+  if (!rows || rows.length === 0) {
+    return ok(`No results for "${query}". ${ftsStatusLine(ftsIndexStats())}`);
+  }
+
+  const allFuzzy = rows.every(r => Number(r.exact_hit) === 0);
+  const lines = formatSearchRows(rows);
+  if (allFuzzy) lines.push(`\n(No exact match for "${query}" — showing best fuzzy/partial matches, ranked.)`);
+  lines.push(`\n${ftsStatusLine(ftsIndexStats())}`);
   return ok(lines.join("\n"));
 }
 
@@ -1203,59 +1323,6 @@ end tell`;
   return ok(output.join("\n"));
 }
 
-// --- Handler: search_body ---
-
-function handleSearchBody(args) {
-  const query = args?.query;
-  if (!query) return err("query is required.");
-  const limit = Math.min(args?.limit || 500, 1000);
-  triggerIndexRefresh();
-
-  const escapedQuery = query.replace(/'/g, "''").replace(/"/g, '""');
-
-  // Try quoted match first, then unquoted
-  let results = parseFts(`
-    SELECT b.id, b.subject, b.sender, snippet(fts, 2, '>>>', '<<<', '...', 40) as snippet, rank
-    FROM fts JOIN bodies b ON b.id = fts.rowid
-    WHERE fts MATCH '"${escapedQuery}"'
-    ORDER BY rank LIMIT ${limit}
-  `);
-
-  if (!results || results.length === 0) {
-    results = parseFts(`
-      SELECT b.id, b.subject, b.sender, snippet(fts, 2, '>>>', '<<<', '...', 40) as snippet, rank
-      FROM fts JOIN bodies b ON b.id = fts.rowid
-      WHERE fts MATCH '${escapedQuery}'
-      ORDER BY rank LIMIT ${limit}
-    `);
-  }
-
-  if (!results || results.length === 0) {
-    const stats = ftsIndexStats();
-    return ok(`No results for "${query}". ${ftsStatusLine(stats)}`);
-  }
-
-  // Get dates from Outlook DB
-  const ids = results.map(r => r.id).join(",");
-  let dateMap = {};
-  try {
-    const dates = runSqlite(`SELECT Record_RecordID as id, Message_TimeReceived FROM Mail WHERE Record_RecordID IN (${ids})`);
-    for (const d of dates) dateMap[d.id] = d.Message_TimeReceived;
-  } catch {}
-
-  const lines = results.map(r => {
-    const date = dateMap[r.id]
-      ? new Date(dateMap[r.id] * 1000).toISOString().slice(0, 10)
-      : "";
-    const snippet = (r.snippet || "").replace(/\n/g, " ").trim();
-    return `ID:${r.id} | ${date} | ${r.sender || ""} | ${r.subject || "(no subject)"}\n  ${snippet}`;
-  });
-
-  const stats = ftsIndexStats();
-  lines.push(`\n${ftsStatusLine(stats)}`);
-  return ok(lines.join("\n"));
-}
-
 // --- Handler: index_now ---
 
 function handleIndexNow() {
@@ -1263,7 +1330,7 @@ function handleIndexNow() {
   return ok(`Index sync complete after ${result.batches} batch(es). ${ftsStatusLine(result.stats)}`);
 }
 
-// --- Start server ---
+// --- Entrypoints: MCP server (default) + CLI ---
 
 async function main() {
   ensureFtsDb();
@@ -1274,9 +1341,104 @@ async function main() {
   console.error("Outlook MCP server running on stdio");
 }
 
-const isDirectRun = process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/^\//, ""));
+const CLI_USAGE = `mcp-outlook — Outlook for Mac search & mail CLI
+
+Usage:
+  mcp-outlook search <query> [--folder F] [--account A] [--after YYYY-MM-DD] [--before YYYY-MM-DD] [--limit N] [--unread]
+  mcp-outlook index                 Build/catch up the full search index
+  mcp-outlook folders               List folders with message counts
+  mcp-outlook get <id> [--quoted]   Show full email content by ID
+  mcp-outlook serve                 Run as an MCP stdio server (default when launched by a client)
+
+Search hits subject, sender, recipients (To/CC) and body across ALL folders incl. Sent.
+Substrings and fuzzy matches are found and ranked automatically (exact matches first).`;
+
+// Minimal arg parser: positional values + --flag / --flag value.
+function parseCliArgs(argv) {
+  const positional = [];
+  const flags = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith("--")) {
+      const key = a.slice(2);
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith("--")) {
+        flags[key] = true;            // boolean flag
+      } else {
+        flags[key] = next; i++;       // flag with value
+      }
+    } else {
+      positional.push(a);
+    }
+  }
+  return { positional, flags };
+}
+
+function printResult(result) {
+  const text = result?.content?.[0]?.text ?? "";
+  process.stdout.write(text + "\n");
+}
+
+function cliMain(argv) {
+  const command = argv[0];
+  const { positional, flags } = parseCliArgs(argv.slice(1));
+  ensureFtsDb();
+
+  switch (command) {
+    case "search": {
+      // Catch up one batch synchronously so a freshly-built index isn't empty.
+      try { syncFtsIndex({ maxBatches: 1 }); } catch {}
+      const query = positional.join(" ");
+      printResult(handleSearch({
+        query,
+        folder: flags.folder,
+        account: flags.account,
+        after: flags.after,
+        before: flags.before,
+        unread_only: flags.unread === true,
+        limit: flags.limit ? Number(flags.limit) : undefined,
+      }));
+      break;
+    }
+    case "index":
+      printResult(handleIndexNow());
+      break;
+    case "folders":
+      printResult(handleListFolders());
+      break;
+    case "get": {
+      const id = Number(positional[0]);
+      if (!Number.isFinite(id)) { process.stderr.write("get: numeric email id required\n"); process.exit(2); }
+      printResult(handleGetEmail({ email_id: id, include_quoted: flags.quoted === true }));
+      break;
+    }
+    default:
+      process.stderr.write(CLI_USAGE + "\n");
+      process.exit(command ? 2 : 0);
+  }
+  process.exit(0);
+}
+
+// realpathSync resolves symlinks so a globally-linked bin still matches the real file.
+let isDirectRun = false;
+try {
+  isDirectRun = process.argv[1] &&
+    realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+} catch { isDirectRun = false; }
+
 if (isDirectRun) {
-  main().catch(console.error);
+  const cmd = process.argv[2];
+  const KNOWN = new Set(["search", "index", "folders", "get", "serve"]);
+  if (cmd === "serve" || (!cmd && !process.stdout.isTTY)) {
+    // Explicit serve, or launched by an MCP client (stdio, not a terminal).
+    main().catch(console.error);
+  } else if (cmd && KNOWN.has(cmd)) {
+    cliMain(process.argv.slice(2));
+  } else {
+    // Bare TTY invocation or unknown subcommand → usage.
+    process.stderr.write(CLI_USAGE + "\n");
+    process.exit(cmd ? 2 : 0);
+  }
 }
 
 export {
@@ -1295,4 +1457,16 @@ export {
   ftsStatusLine,
   ok,
   err,
+  // search internals (for tests)
+  queryTerms,
+  expandTerms,
+  ftsToken,
+  likePattern,
+  sqlLit,
+  ensureFtsDb,
+  createFtsSchema,
+  handleSearch,
+  parseCliArgs,
+  FTS_COLUMNS,
+  BM25_WEIGHTS,
 };
