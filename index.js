@@ -718,10 +718,12 @@ function buildFilterClause(args) {
   if (args?.account) parts.push(`b.account = '${sqlLit(args.account)}'`);
   if (args?.unread_only) parts.push(`b.read_flag = 0`);
   if (args?.after) {
-    const ts = Math.floor(new Date(args.after).getTime() / 1000);
+    // Parse as start of the LOCAL day (no Z) so date bounds match what the user sees.
+    const ts = Math.floor(new Date(args.after + "T00:00:00").getTime() / 1000);
     if (!isNaN(ts)) parts.push(`b.ts >= ${ts}`);
   }
   if (args?.before) {
+    // Parse as end of the LOCAL day so `before` is inclusive of that whole day.
     const ts = Math.floor(new Date(args.before + "T23:59:59").getTime() / 1000);
     if (!isNaN(ts)) parts.push(`b.ts <= ${ts}`);
   }
@@ -742,9 +744,19 @@ function rowSelectCols() {
           b.ts, b.read_flag, b.has_attach`;
 }
 
+// Render a Unix epoch (seconds) as a YYYY-MM-DD string in the machine's LOCAL
+// timezone. toISOString() would force UTC and shift the date across midnight.
+function localDate(epochSeconds) {
+  const d = new Date(epochSeconds * 1000);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 function formatSearchRows(rows) {
   return rows.map(r => {
-    const date = r.ts ? new Date(r.ts * 1000).toISOString().slice(0, 10) : "";
+    const date = r.ts ? localDate(r.ts) : "";
     const from = r.sender_name || r.sender_addr || "";
     const account = r.account ? `${r.account}/` : "";
     const unread = r.read_flag ? " " : "●";
