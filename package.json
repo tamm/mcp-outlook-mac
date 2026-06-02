@@ -4,6 +4,9 @@
   "description": "MCP server for Microsoft Outlook on macOS",
   "main": "index.js",
   "type": "module",
+  "bin": {
+    "mcp-outlook": "index.js"
+  },
   "scripts": {
     "start": "node index.js",
     "test": "node --test 'test/*.test.js'"

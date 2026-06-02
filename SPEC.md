@@ -15,14 +15,31 @@ To fix: **Help > Revert to Legacy Outlook**. Once reverted, all tools work.
 | Tool | What it does |
 |------|-------------|
 | `list_folders` | Lists all folders with message counts |
-| `search_emails` | List inbox emails matching optional filters. Defaults to the full inbox (newest first) — narrow only when needed. Supports subject/sender query, date range, unread filter, sort, account filter |
+| `search_emails` | **The one search tool.** Searches subject, sender, recipients (To/CC) and body across ALL folders incl. Sent, by default. Trigram substring + fuzzy matching, exact matches ranked first. Multi-word queries decomposed and ranked by parts matched. Just pass a query. |
 | `get_email` | Full email content by ID. Strips signatures and quoted replies by default; pass `include_quoted: true` to keep them. Shows read/flagged status |
 | `compose` | Draft new email, reply, or forward. Body is markdown |
 | `move_email` | Move email to a folder (e.g. Archive) |
 | `archive_emails` | Batch archive — moves multiple emails to Archive |
 | `download_attachment` | Save attachment(s) to disk |
-| `search_body` | Full-text body search using FTS5 index with BM25 ranking |
-| `index_now` | Trigger immediate FTS5 index pass |
+| `index_now` | Build/catch up the search index immediately |
+
+There is **one** search tool (`search_emails`). The old `search_body` is gone — body content is now searched as part of the unified search.
+
+## CLI
+
+`index.js` doubles as a CLI (via the `mcp-outlook` bin). Same logic as the MCP tools, no server needed:
+
+```
+mcp-outlook search 'tamm@'                       # everything to/from/mentioning tamm@, ranked
+mcp-outlook search 'Project X with person A'     # multi-term, ranked by parts matched
+mcp-outlook search 'invoice' --folder Sent       # narrow to a folder
+mcp-outlook index                                # build/catch up the index
+mcp-outlook folders                              # list folders
+mcp-outlook get 12345 [--quoted]                 # full email by id
+mcp-outlook serve                                # run as MCP stdio server (the default when launched by a client)
+```
+
+With no subcommand: launched by an MCP client (no TTY) → starts the stdio server; run bare in a terminal → prints usage.
 
 ## Architecture
 
@@ -40,14 +57,22 @@ Everything is in `index.js`. The tool definitions in `index.js` are the source o
 
 ### SQLite read path
 
-`list_folders`, `search_emails` read directly from Outlook's SQLite database (`~/Library/Group Containers/UBF8T346G9.Office/Outlook/Outlook 15 Profiles/Main Profile/Data/Outlook.sqlite`). This is much faster than AppleScript iteration. `get_email` uses AppleScript for full message content since the SQLite DB only stores previews.
+`list_folders` reads directly from Outlook's SQLite database (`~/Library/Group Containers/UBF8T346G9.Office/Outlook/Outlook 15 Profiles/Main Profile/Data/Outlook.sqlite`). `search_emails` reads from the local FTS index (below), which is synced from that same Outlook DB. `get_email` uses AppleScript for full message content since the SQLite DB only stores previews. All sqlite invocations use `execFileSync` (no shell) — query text is passed as a literal arg, so arbitrary user input cannot inject shell commands.
 
-### FTS5 body search
+### Unified search index (FTS5 trigram)
 
-`search_body` uses a local FTS5 index at `~/.mcp-outlook-mac/body-index.db`. The index builds incrementally:
-- Every `get_email` call indexes that email's body text
-- `index_now` triggers a batch pass using message previews from SQLite
-- BM25 relevance ranking with `>>>` / `<<<` snippet markers
+`search_emails` queries a local FTS5 index at `~/.mcp-outlook-mac/body-index.db` (override with `MCP_OUTLOOK_FTS_DB`). One `bodies` table holds every searchable field — subject, sender name, sender address, To, CC, body — plus stored metadata (folder, account, timestamp, read flag, attachment flag) so a single query renders and filters results with **no round-trip to Outlook**. An external-content FTS5 virtual table (`tokenize='trigram'`) indexes the six text columns.
+
+- **Trigram tokenizer** gives substring-anywhere matching for queries ≥3 chars (e.g. `tamm@` matches mid-string), and natural fuzzy matching via shared trigrams.
+- **Ranking** (in `handleSearch`): `ORDER BY exact_hit DESC, terms_matched DESC, best_bm ASC, ts DESC`.
+  - `exact_hit` — does the full query appear as a literal substring (LIKE) in any column? Exact substrings always rank above fuzzy near-matches.
+  - `terms_matched` — for multi-word queries, how many distinct terms a row matched (per-term `UNION ALL` + `GROUP BY`). More parts matched → higher.
+  - `best_bm` — BM25 with column weights `[8,10,10,9,9,2]` (subject/sender/recipients weighted above body, which is preview-only in bulk).
+  - The `per_term` CTE is `MATERIALIZED` — required so BM25 (an FTS5 auxiliary function) is evaluated in the same query as its MATCH.
+- **Fuzzy expansion** (`expandTerms`): each term also searches its alphanumeric core (leading/trailing punctuation stripped), so `tamm@` additionally surfaces `@tamm` — ranked below exact hits.
+- **Short queries** (all tokens ≤2 chars, below the trigram floor) fall back to a pure LIKE-substring path.
+- Index builds incrementally: `index_now` / background refresh batch-syncs all fields using `Message_Preview` for body; every `get_email` upgrades that row's body to full text. BM25 snippets use `>>>` / `<<<` markers.
+- **Schema versioned** via `PRAGMA user_version` (`FTS_SCHEMA_VERSION`). On a version bump, `ensureFtsDb` drops and rebuilds the tables and clears `indexed` to force a full re-sync — a one-time pass on first run after upgrade.
 
 ### Signature and quote stripping
 
@@ -65,18 +90,17 @@ Pass `include_quoted: true` to skip all stripping and return the full raw body.
 
 The `compose` tool uses `textutil` to convert markdown→HTML→RTF, then injects the RTF directly into the message via `read POSIX file ... as «class RTF »`. This avoids clipboard hijacking.
 
-### Search features
+### Search parameters
 
-`search_emails` lists all Inbox emails by default (up to 500, hard cap 1000) and biases toward unbounded scope — callers should only narrow when the task actually requires it. All filters are optional:
-- `query` — substring match on subject/sender
-- `folder` — restrict to a folder (default: all Inboxes)
-- `account` — restrict to an account
-- `unread_only` — only unread emails
-- `after` / `before` — date bounds (YYYY-MM-DD) — omit for no date bound
-- `limit` — optional max results (default 500, hard cap 1000)
-- `sort` — `desc` (default) or `asc`
+`search_emails` parameters (all optional):
+- `query` — matched against subject, sender name + address, To, CC and body. Substrings, fuzzy near-matches, and multi-word queries all handled automatically. Omit to list newest emails.
+- `folder` — restrict to a named folder. **Omit to search all folders** (including Sent) — almost always correct.
+- `account` — restrict to one account. Omit for all accounts.
+- `unread_only` — only unread emails.
+- `after` / `before` — date bounds (YYYY-MM-DD). Omit unless a date range is specifically needed.
+- `limit` — default 500, hard cap 1000. Omit — the default is sufficient.
 
-Results show `●` for unread, `⚑` for flagged, `📎` for attachments.
+Results show `●` for unread and `📎` for attachments, with a BM25 snippet under each hit.
 
 ### Sender property access
 
@@ -100,8 +124,10 @@ set msgSender to name of sRec
 ## Known limitations
 
 - **New Outlook is unsupported.** Must use Legacy Outlook.
-- **FTS index uses previews for batch indexing.** Full body text is only indexed when `get_email` is called. Run `index_now` for broader coverage, but snippets will be from preview text only.
-- **SQLite column names may vary.** `Message_IsRead` and `Message_IsFlagged` are assumed — if these don't exist in your Outlook version, unread/flagged indicators will be missing from search results.
+- **Body search is preview-text for un-opened mail, full text once opened.** Bulk indexing uses `Message_Preview` (full body is only reachable via AppleScript, one message at a time). Subject, sender and recipients are indexed completely and exactly. Opening an email via `get_email` upgrades its body to full text.
+- **No BCC, no attachment-filename search.** Outlook's local SQLite doesn't store BCC or attachment names (only a has-attachment flag).
+- **First run after a schema bump rebuilds the index** (one-time, well under a minute for ~35k emails; ~100 MB on disk with body trigram-indexed).
+- **SQLite column names may vary.** `Message_ReadFlag` / `Message_HasAttachment` are assumed — if absent in your Outlook version, those indicators will be missing.
 
 ## Operations without dedicated tools
 
