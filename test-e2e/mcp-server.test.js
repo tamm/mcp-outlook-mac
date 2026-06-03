@@ -163,66 +163,48 @@ describe("search_emails", () => {
     }
   });
 
-  it("sort asc puts oldest email first", async () => {
-    const textAsc = await callTool(server, "search_emails", { limit: 5, sort: "asc" });
-    const textDesc = await callTool(server, "search_emails", { limit: 5, sort: "desc" });
+  it("default (no query) lists newest emails first", async () => {
+    // search_emails has no sort arg: an empty query lists newest-first by ts.
+    const text = await callTool(server, "search_emails", { limit: 5 });
 
-    const extractIds = (text) =>
-      text.split("\n")
-        .filter((l) => l.startsWith("ID:"))
-        .map((l) => parseInt(l.match(/^ID:(\d+)/)?.[1] ?? "0", 10));
+    const ids = text.split("\n")
+      .filter((l) => l.startsWith("ID:"))
+      .map((l) => parseInt(l.match(/^ID:(\d+)/)?.[1] ?? "0", 10));
 
-    const idsAsc = extractIds(textAsc);
-    const idsDesc = extractIds(textDesc);
-
-    // Need at least one result to do any ordering check
-    if (idsAsc.length === 0) {
-      console.log("  (skipped: no emails returned — cannot verify sort order)");
+    if (ids.length < 2) {
+      console.log("  (skipped: fewer than 2 emails returned — cannot verify order)");
       return;
     }
 
-    // Use a SQLite probe to independently verify that the first asc result is
-    // older-or-equal in time to the first desc result.  This is robust even
-    // when the two windows (oldest-5 vs newest-5) don't overlap at all.
-    const firstAscId = idsAsc[0];
-    const firstDescId = idsDesc[0];
-
-    if (firstAscId && firstDescId && firstAscId !== firstDescId) {
-      const rows = probeSqlite(
-        `SELECT Record_RecordID, Message_TimeReceived FROM Mail
-         WHERE Record_RecordID IN (${firstAscId}, ${firstDescId})`
-      );
-      const byId = Object.fromEntries(rows.map((r) => [r.Record_RecordID, r.Message_TimeReceived]));
-      const tsAsc = byId[firstAscId];
-      const tsDesc = byId[firstDescId];
-      if (tsAsc !== undefined && tsDesc !== undefined) {
-        assert.ok(
-          tsAsc <= tsDesc,
-          `Expected first asc result (ts=${tsAsc}) to be older-or-equal to first desc result (ts=${tsDesc})`
-        );
+    // Independently confirm the rendered order is descending by Message_TimeReceived.
+    const rows = probeSqlite(
+      `SELECT Record_RecordID, Message_TimeReceived FROM Mail
+       WHERE Record_RecordID IN (${ids.join(",")})`
+    );
+    const tsById = Object.fromEntries(rows.map((r) => [r.Record_RecordID, r.Message_TimeReceived]));
+    for (let i = 1; i < ids.length; i++) {
+      const prev = tsById[ids[i - 1]];
+      const cur = tsById[ids[i]];
+      if (prev !== undefined && cur !== undefined) {
+        assert.ok(prev >= cur, `Expected newest-first order, but ts ${prev} preceded ${cur}`);
       }
-    }
-
-    // If there's more than one result in the same window, the lists should differ
-    if (idsAsc.length > 1 && idsDesc.length > 1) {
-      assert.notDeepEqual(idsAsc, idsDesc, "Ascending and descending order should differ");
     }
   });
 });
 
 // ---------------------------------------------------------------------------
-// search_body
+// search_emails — body / full-text search (search_body was merged into this)
 // ---------------------------------------------------------------------------
 
-describe("search_body", () => {
+describe("search_emails (body/full-text)", () => {
   it("returns a result or index status without crashing", async () => {
     // Use a very common word likely to appear in any mailbox
-    const text = await callTool(server, "search_body", { query: "the", limit: 3 });
+    const text = await callTool(server, "search_emails", { query: "the", limit: 3 });
 
     assert.ok(typeof text === "string", "Expected string response");
     assert.ok(!text.startsWith("Error:"), `Unexpected error: ${text}`);
     // Response always ends with an index status line
-    assert.ok(text.includes("Index:"), "Expected index status line in search_body response");
+    assert.ok(text.includes("Index:"), "Expected index status line in search response");
   });
 });
 
