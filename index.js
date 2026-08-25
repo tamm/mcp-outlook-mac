@@ -573,7 +573,7 @@ const TOOLS = [
       type: "object",
       properties: {
         query: { type: "string", description: "What to find — matched against subject, sender, To, CC and body. Substrings/fuzzy/multi-word all handled. Omit to list newest emails." },
-        folder: { type: "string", description: "Restrict to one folder (e.g. 'Sent', 'Archive'). OMIT to search all folders — almost always correct." },
+        folder: { type: "string", description: "Restrict to one folder. Accepts a bare name, a shorthand ('Sent' matches 'Sent Items'), or the 'Account/Folder' string list_folders prints. OMIT to search all folders — almost always correct." },
         account: { type: "string", description: "Restrict to one account. OMIT to search all accounts." },
         limit: { type: "number", description: "Max results (default 500, cap 1000). OMIT — the default is right for most tasks." },
         unread_only: { type: "boolean", description: "Only unread emails. OMIT unless you specifically want unread-only." },
@@ -728,7 +728,14 @@ function likePattern(query) {
 // Build WHERE fragments for the optional filters, operating on stored bodies columns.
 function buildFilterClause(args) {
   const parts = [];
-  if (args?.folder) parts.push(`b.folder = '${sqlLit(args.folder)}'`);
+  if (args?.folder) {
+    // Match tolerantly: list_folders prints "Account/Folder", the index stores the
+    // bare folder name, and callers reasonably say "Sent" for "Sent Items". Take the
+    // last path segment and prefix-match case-insensitively.
+    const name = String(args.folder).split("/").pop().trim().toLowerCase();
+    const esc = sqlLit(name.replace(/[%_\\]/g, c => "\\" + c));
+    parts.push(`LOWER(b.folder) LIKE '${esc}%' ESCAPE '\\'`);
+  }
   if (args?.account) parts.push(`b.account = '${sqlLit(args.account)}'`);
   if (args?.unread_only) parts.push(`b.read_flag = 0`);
   if (args?.after) {

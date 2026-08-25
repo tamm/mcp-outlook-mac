@@ -112,6 +112,8 @@ This means a caller can add an extra CC to a reply-all without having to re-spec
 `search_emails` parameters (all optional):
 - `query` — matched against subject, sender name + address, To, CC and body. Substrings, fuzzy near-matches, and multi-word queries all handled automatically. Omit to list newest emails.
 - `folder` — restrict to a named folder. **Omit to search all folders** (including Sent) — almost always correct.
+  Matched as a case-insensitive prefix on the last `/` segment, so a bare name (`Archive`), a shorthand
+  (`Sent` → `Sent Items`) and the `Account/Folder` string `list_folders` prints all resolve to the same folder.
 - `account` — restrict to one account. Omit for all accounts.
 - `unread_only` — only unread emails.
 - `after` / `before` — date bounds (YYYY-MM-DD). Omit unless a date range is specifically needed.

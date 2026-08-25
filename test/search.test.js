@@ -24,7 +24,7 @@ function seed() {
     // id, subject, sender_name, sender_addr, to_addr, cc_addr, body, folder, account, ts, read, attach
     [1, "Q3 budget call", "Tamm Sjodin", "tamm@example.com", "finance@racat.com", "", "Let us lock the Q3 numbers.", "Inbox", "Work", 1700000000, 1, 0],
     [2, "Re: lunch", "Bob Jones", "bob@other.com", "someone@x.com", "", "see you at the @tamm cafe near the park", "Inbox", "Work", 1700000100, 1, 0],
-    [3, "Project X kickoff", "Alice Smith", "alice@x.com", "tamm@example.com", "team@x.com", "Project X with person A is going well, lots to do", "Sent", "Work", 1700000200, 0, 1],
+    [3, "Project X kickoff", "Alice Smith", "alice@x.com", "tamm@example.com", "team@x.com", "Project X with person A is going well, lots to do", "Sent Items", "Work", 1700000200, 0, 1],
     [4, "Newsletter", "News Bot", "news@foo.com", "list@foo.com", "", "nothing relevant here at all", "Inbox", "Work", 1700000300, 1, 0],
     [5, "person A sync", "Carol", "carol@y.com", "tamm@example.com", "", "Quick note about person A and the roadmap", "Archive", "Work", 1700000400, 1, 0],
   ];
@@ -118,7 +118,22 @@ describe("handleSearch end-to-end (fixture index)", () => {
 
   it("folder filter narrows scope", () => {
     const ids = idsFrom(handleSearch({ query: "tamm@", folder: "Sent" }));
-    assert.deepEqual(ids, [3], `folder=Sent should return only id 3, got ${ids}`);
+    assert.deepEqual(ids, [3], `folder=Sent should match "Sent Items", got ${ids}`);
+  });
+
+  it("folder filter accepts the Account/Folder string list_folders prints", () => {
+    const ids = idsFrom(handleSearch({ query: "tamm@", folder: "Work/Sent Items" }));
+    assert.deepEqual(ids, [3], `composite folder id should work, got ${ids}`);
+  });
+
+  it("folder filter is case-insensitive", () => {
+    const ids = idsFrom(handleSearch({ query: "tamm@", folder: "archive" }));
+    assert.deepEqual(ids, [5], `lowercase folder should match Archive, got ${ids}`);
+  });
+
+  it("folder filter does not silently match everything on junk input", () => {
+    const ids = idsFrom(handleSearch({ query: "tamm@", folder: "Nope" }));
+    assert.deepEqual(ids, [], `unknown folder should return nothing, got ${ids}`);
   });
 
   it("matches body substrings, not just metadata", () => {
