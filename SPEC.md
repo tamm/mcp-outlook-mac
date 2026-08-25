@@ -88,7 +88,11 @@ Pass `include_quoted: true` to skip all stripping and return the full raw body.
 
 ### Compose with RTF injection
 
-Markdown is parsed with hard line breaks on (`breaks: true`), so a single newline becomes a `<br>`. Email bodies are line-oriented, not web documents: a one-per-line list must stay one per line.
+Markdown is parsed with hard line breaks on (`breaks: true`), then `brToParagraphs` rewrites every `<br>`
+into a tight `<p style="margin:0">`. This is not cosmetic: **`textutil`'s HTML importer drops `<br>` outright**,
+so `breaks: true` alone still glued one-per-line lists together. Block elements survive the conversion; inline
+breaks do not. The last line of a run keeps the default paragraph spacing, so blank-line paragraphs still get
+their gap while single newlines stay tight.
 
 The `compose` tool uses `textutil` to convert markdown→HTML→RTF, then injects the RTF directly into the message via `read POSIX file ... as «class RTF »`. This avoids clipboard hijacking.
 

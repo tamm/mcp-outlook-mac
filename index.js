@@ -140,8 +140,22 @@ function cleanBody(text) {
 
 // --- Markdown to HTML ---
 
+// textutil's HTML importer silently DROPS <br>, so `breaks: true` alone is not
+// enough — a one-per-line list still arrives glued together. Turn each <br> into
+// a real paragraph instead. Every line but the last in the run gets margin:0
+// (textutil emits no \sa, so it reads as a plain line break); the last keeps the
+// default paragraph spacing, so blank-line paragraphs still get their gap.
+function brToParagraphs(html) {
+  return html.replace(/<p>([\s\S]*?)<\/p>/g, (whole, inner) => {
+    if (!/<br\s*\/?>/.test(inner)) return whole;
+    const parts = inner.split(/<br\s*\/?>\s*/);
+    const last = parts.pop();
+    return parts.map(line => `<p style="margin:0">${line}</p>`).join("") + `<p>${last}</p>`;
+  });
+}
+
 function markdownToHtml(text) {
-  const html = marked.parse(text, { async: false, breaks: true });
+  const html = brToParagraphs(marked.parse(text, { async: false, breaks: true }));
   return `<div style="font-family: Aptos, Calibri, sans-serif; font-size: 12pt;">${html}</div>`;
 }
 
@@ -1496,6 +1510,7 @@ export {
   stripQuotedReplies,
   cleanBody,
   fillRecipientsFromDb,
+  brToParagraphs,
   markdownToHtml,
   coerceEmailIds,
   setRecipientsScript,

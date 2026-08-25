@@ -2,6 +2,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
 import os from "node:os";
+import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import {
   extractEmail,
   parseRecipients,
@@ -11,6 +13,7 @@ import {
   stripQuotedReplies,
   cleanBody,
   fillRecipientsFromDb,
+  brToParagraphs,
   markdownToHtml,
   coerceEmailIds,
   setRecipientsScript,
@@ -336,19 +339,79 @@ describe("markdownToHtml", () => {
     assert.ok(result.includes("font-family"));
   });
 
-  it("turns single newlines into hard line breaks", () => {
+  it("turns single newlines into separate line-broken blocks", () => {
     const result = markdownToHtml(
       "Sophie Hanson, sophie.hanson@junkeemedia.com\n" +
         "Lia Kim, lia.kim@junkeemedia.com\n" +
         "Yagmur Ilkyaz, Yagmur.Ilkyaz@junkeemedia.com"
     );
-    assert.equal((result.match(/<br\s*\/?>/g) || []).length, 2);
+    // Not <br> — textutil drops those. Each line becomes its own tight paragraph.
+    assert.equal((result.match(/<p style="margin:0">/g) || []).length, 2);
+    assert.ok(!/<br/.test(result));
   });
 
   it("keeps blank-line paragraphs separate", () => {
     const result = markdownToHtml("first para\n\nsecond para");
     assert.ok(result.includes("<p>first para</p>"));
     assert.ok(result.includes("<p>second para</p>"));
+  });
+});
+
+describe("brToParagraphs", () => {
+  it("splits a <br> run into paragraphs, last one keeping default spacing", () => {
+    assert.equal(
+      brToParagraphs("<p>one<br>two<br>three</p>"),
+      '<p style="margin:0">one</p><p style="margin:0">two</p><p>three</p>'
+    );
+  });
+
+  it("leaves <br>-free paragraphs alone", () => {
+    const html = "<p>just one line</p>\n<p>and another</p>";
+    assert.equal(brToParagraphs(html), html);
+  });
+
+  it("handles self-closing <br/>", () => {
+    assert.ok(brToParagraphs("<p>a<br/>b</p>").includes('<p style="margin:0">a</p>'));
+  });
+
+  it("does not disturb list markup", () => {
+    const html = "<ul>\n<li>one</li>\n<li>two</li>\n</ul>";
+    assert.equal(brToParagraphs(html), html);
+  });
+});
+
+// The bug Tamm reported survived a correct <br> because textutil's HTML importer
+// DROPS <br> outright. Only a round-trip through textutil proves the fix.
+describe("compose body rendering through textutil (the real pipeline)", () => {
+  function renderToText(md) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-outlook-rtf-"));
+    const html = path.join(dir, "b.html");
+    const rtf = path.join(dir, "b.rtf");
+    fs.writeFileSync(html, markdownToHtml(md), "utf-8");
+    execFileSync("textutil", ["-inputencoding", "UTF-8", "-format", "html", "-convert", "rtf", "-output", rtf, html]);
+    const out = execFileSync("textutil", ["-format", "rtf", "-convert", "txt", "-stdout", rtf], { encoding: "utf-8" });
+    fs.rmSync(dir, { recursive: true, force: true });
+    return out.replace(/\s+$/, "").split("\n");
+  }
+
+  it("renders a one-per-line recipient list on separate lines", () => {
+    const lines = renderToText(
+      "Sophie Hanson, sophie.hanson@junkeemedia.com\n" +
+        "Lia Kim, lia.kim@junkeemedia.com\n" +
+        "Yagmur Ilkyaz, Yagmur.Ilkyaz@junkeemedia.com"
+    );
+    assert.equal(lines.length, 3, `expected 3 lines, got: ${JSON.stringify(lines)}`);
+    assert.match(lines[1], /^Lia Kim/);
+  });
+
+  it("still renders bullet lists one per line", () => {
+    const lines = renderToText("- one\n- two\n- three");
+    assert.equal(lines.length, 3, `expected 3 bullets, got: ${JSON.stringify(lines)}`);
+  });
+
+  it("keeps blank-line paragraphs on their own lines", () => {
+    const lines = renderToText("First para.\n\nSecond para.");
+    assert.deepEqual(lines, ["First para.", "Second para."]);
   });
 });
 
