@@ -264,6 +264,21 @@ describe("markdownToHtml", () => {
     assert.ok(result.includes("<p>hello world</p>"));
     assert.ok(result.includes("font-family"));
   });
+
+  it("turns single newlines into hard line breaks", () => {
+    const result = markdownToHtml(
+      "Sophie Hanson, sophie.hanson@junkeemedia.com\n" +
+        "Lia Kim, lia.kim@junkeemedia.com\n" +
+        "Yagmur Ilkyaz, Yagmur.Ilkyaz@junkeemedia.com"
+    );
+    assert.equal((result.match(/<br\s*\/?>/g) || []).length, 2);
+  });
+
+  it("keeps blank-line paragraphs separate", () => {
+    const result = markdownToHtml("first para\n\nsecond para");
+    assert.ok(result.includes("<p>first para</p>"));
+    assert.ok(result.includes("<p>second para</p>"));
+  });
 });
 
 describe("coerceEmailIds", () => {

@@ -141,7 +141,7 @@ function cleanBody(text) {
 // --- Markdown to HTML ---
 
 function markdownToHtml(text) {
-  const html = marked.parse(text, { async: false });
+  const html = marked.parse(text, { async: false, breaks: true });
   return `<div style="font-family: Aptos, Calibri, sans-serif; font-size: 12pt;">${html}</div>`;
 }
 
