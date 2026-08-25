@@ -1123,7 +1123,7 @@ end tell`;
   // Provided field wipes and rebuilds that field only; the other is left untouched
   // so native reply/reply-all population is preserved for the unspecified side.
   let recipientOverride = null;
-  if (mode === "reply") {
+  {
     const hasTo = args?.to != null;
     const hasCc = args?.cc != null;
     if (hasTo || hasCc) {
@@ -1172,13 +1172,21 @@ end tell`;
       if (result && result.startsWith("Error:")) return err(result.slice(7));
       return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
     } catch (rtfErr) {
-      console.error(`[compose] RTF injection failed for draft ${composeId}, falling back to clipboard paste: ${rtfErr.message}`);
-      pasteViaClipboard(htmlBody);
+      // Outlook refuses «class RTF » on message objects here, so fall back to the
+      // HTML content property — the same thing composeNew falls back to, and the
+      // reason `new` has always worked. Prepending rather than replacing keeps the
+      // quoted original thread intact.
+      //
+      // This used to paste via the clipboard into the FRONT window, which put the
+      // body into whatever window happened to be frontmost — or nowhere — while
+      // still reporting success.
+      console.error(`[compose] RTF injection failed for draft ${composeId}, using HTML content property: ${rtfErr.message}`);
+      const escapedHtml = escapeForAppleScript(htmlBody);
       const fallbackScript = `
 tell application "Microsoft Outlook"
-    set composeMsg to message id ${composeId}${recipientFix}
-end tell
-${pasteIntoFrontWindow()}`;
+    set composeMsg to message id ${composeId}
+    set content of composeMsg to ("${escapedHtml}" & content of composeMsg)${recipientFix}
+end tell`;
       const result = runAppleScriptHeredoc(fallbackScript);
       if (result && result.startsWith("Error:")) return err(result.slice(7));
       return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
