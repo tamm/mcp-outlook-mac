@@ -140,22 +140,33 @@ function cleanBody(text) {
 
 // --- Markdown to HTML ---
 
-// textutil's HTML importer silently DROPS <br>, so `breaks: true` alone is not
-// enough — a one-per-line list still arrives glued together. Turn each <br> into
-// a real paragraph instead. Every line but the last in the run gets margin:0
-// (textutil emits no \sa, so it reads as a plain line break); the last keeps the
-// default paragraph spacing, so blank-line paragraphs still get their gap.
-function brToParagraphs(html) {
-  return html.replace(/<p>([\s\S]*?)<\/p>/g, (whole, inner) => {
-    if (!/<br\s*\/?>/.test(inner)) return whole;
-    const parts = inner.split(/<br\s*\/?>\s*/);
-    const last = parts.pop();
-    return parts.map(line => `<p style="margin:0">${line}</p>`).join("") + `<p>${last}</p>`;
-  });
+// Two things fight us on the way to an Outlook draft:
+//   1. textutil's HTML importer silently DROPS <br>, so marked's `breaks: true`
+//      alone still delivers a one-per-line list glued into one paragraph.
+//   2. Outlook does not render the default paragraph spacing textutil emits the
+//      way textutil's own txt conversion suggests, so ANY reliance on default
+//      <p> margins puts a stray gap in the middle of a run.
+// So state every paragraph explicitly and lean on no defaults at all: each source
+// line becomes its own margin:0 paragraph, and a markdown paragraph break becomes
+// a real empty paragraph. That is what an email body looks like as plain text,
+// which is what a mail body is.
+const SPACER = '<p style="margin:0">&nbsp;</p>';
+
+function emailParagraphs(html) {
+  const out = html.replace(/<p>([\s\S]*?)<\/p>/g, (whole, inner) =>
+    inner
+      .split(/<br\s*\/?>\s*/)
+      .map(line => `<p style="margin:0">${line}</p>`)
+      .join("") + SPACER
+  );
+  // the trailing spacer after the final paragraph is just dead space
+  return out.endsWith(SPACER + "\n") ? out.slice(0, -(SPACER.length + 1)) + "\n"
+       : out.endsWith(SPACER) ? out.slice(0, -SPACER.length)
+       : out;
 }
 
 function markdownToHtml(text) {
-  const html = brToParagraphs(marked.parse(text, { async: false, breaks: true }));
+  const html = emailParagraphs(marked.parse(text, { async: false, breaks: true }));
   return `<div style="font-family: Aptos, Calibri, sans-serif; font-size: 12pt;">${html}</div>`;
 }
 
@@ -1510,7 +1521,7 @@ export {
   stripQuotedReplies,
   cleanBody,
   fillRecipientsFromDb,
-  brToParagraphs,
+  emailParagraphs,
   markdownToHtml,
   coerceEmailIds,
   setRecipientsScript,

@@ -13,7 +13,7 @@ import {
   stripQuotedReplies,
   cleanBody,
   fillRecipientsFromDb,
-  brToParagraphs,
+  emailParagraphs,
   markdownToHtml,
   coerceEmailIds,
   setRecipientsScript,
@@ -335,7 +335,7 @@ describe("markdownToHtml", () => {
 
   it("passes plain text through wrapped in p tags", () => {
     const result = markdownToHtml("hello world");
-    assert.ok(result.includes("<p>hello world</p>"));
+    assert.ok(result.includes('<p style="margin:0">hello world</p>'));
     assert.ok(result.includes("font-family"));
   });
 
@@ -346,37 +346,50 @@ describe("markdownToHtml", () => {
         "Yagmur Ilkyaz, Yagmur.Ilkyaz@junkeemedia.com"
     );
     // Not <br> — textutil drops those. Each line becomes its own tight paragraph.
-    assert.equal((result.match(/<p style="margin:0">/g) || []).length, 2);
+    assert.equal((result.match(/<p style="margin:0">/g) || []).length, 3);
     assert.ok(!/<br/.test(result));
   });
 
   it("keeps blank-line paragraphs separate", () => {
     const result = markdownToHtml("first para\n\nsecond para");
-    assert.ok(result.includes("<p>first para</p>"));
-    assert.ok(result.includes("<p>second para</p>"));
+    assert.ok(result.includes('<p style="margin:0">first para</p>'));
+    assert.ok(result.includes('<p style="margin:0">second para</p>'));
+    // separated by a real empty paragraph, not by a margin Outlook may ignore
+    assert.ok(result.includes('<p style="margin:0">&nbsp;</p>'));
   });
 });
 
-describe("brToParagraphs", () => {
-  it("splits a <br> run into paragraphs, last one keeping default spacing", () => {
+describe("emailParagraphs", () => {
+  it("makes every line of a <br> run its own margin:0 paragraph", () => {
     assert.equal(
-      brToParagraphs("<p>one<br>two<br>three</p>"),
-      '<p style="margin:0">one</p><p style="margin:0">two</p><p>three</p>'
+      emailParagraphs("<p>one<br>two<br>three</p>"),
+      '<p style="margin:0">one</p><p style="margin:0">two</p><p style="margin:0">three</p>'
     );
   });
 
-  it("leaves <br>-free paragraphs alone", () => {
-    const html = "<p>just one line</p>\n<p>and another</p>";
-    assert.equal(brToParagraphs(html), html);
+  it("leaves no paragraph relying on a default margin", () => {
+    const out = emailParagraphs("<p>a<br>b</p>\n<p>c</p>");
+    assert.ok(!/<p>/.test(out), `bare <p> would inherit Outlook's spacing: ${out}`);
   });
 
-  it("handles self-closing <br/>", () => {
-    assert.ok(brToParagraphs("<p>a<br/>b</p>").includes('<p style="margin:0">a</p>'));
+  it("separates markdown paragraphs with a real empty paragraph", () => {
+    const out = emailParagraphs("<p>first</p>\n<p>second</p>");
+    assert.ok(out.includes('<p style="margin:0">&nbsp;</p>'));
+    assert.ok(out.indexOf("first") < out.indexOf("&nbsp;"));
+    assert.ok(out.indexOf("&nbsp;") < out.indexOf("second"));
+  });
+
+  it("does not leave a trailing spacer after the final paragraph", () => {
+    assert.ok(!emailParagraphs("<p>only</p>").includes("&nbsp;"));
   });
 
   it("does not disturb list markup", () => {
     const html = "<ul>\n<li>one</li>\n<li>two</li>\n</ul>";
-    assert.equal(brToParagraphs(html), html);
+    assert.equal(emailParagraphs(html), html);
+  });
+
+  it("handles self-closing <br/>", () => {
+    assert.ok(emailParagraphs("<p>a<br/>b</p>").includes('<p style="margin:0">b</p>'));
   });
 });
 
@@ -409,9 +422,12 @@ describe("compose body rendering through textutil (the real pipeline)", () => {
     assert.equal(lines.length, 3, `expected 3 bullets, got: ${JSON.stringify(lines)}`);
   });
 
-  it("keeps blank-line paragraphs on their own lines", () => {
+  it("separates blank-line paragraphs with a genuine blank line", () => {
     const lines = renderToText("First para.\n\nSecond para.");
-    assert.deepEqual(lines, ["First para.", "Second para."]);
+    assert.equal(lines.length, 3, `expected a blank line between: ${JSON.stringify(lines)}`);
+    assert.equal(lines[0], "First para.");
+    assert.equal(lines[1].trim(), "", `middle line should be blank: ${JSON.stringify(lines[1])}`);
+    assert.equal(lines[2], "Second para.");
   });
 });
 
