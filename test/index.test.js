@@ -259,6 +259,42 @@ describe("fillRecipientsFromDb", () => {
     assert.equal(fillRecipientsFromDb(sent, null, undefined), sent);
     assert.equal(fillRecipientsFromDb(sent, "  ", ""), sent);
   });
+
+  // Real-world repro: a reply quotes the earlier message's headers, so the body
+  // contains its own "To:"/"CC:" lines. Those must not count as a populated header.
+  const quotedReply = [
+    "Subject: Re: VPN",
+    "From: Tamm <tamm@australiangeographic.com>",
+    "To: ",
+    "Date: Tuesday, 25 August 2026 at 18:58:23",
+    "",
+    "Thanks, all sorted.",
+    "",
+    "From: Richard <richard@escadia.com.au>",
+    "To: Tamm Sjodin <tamm@australiangeographic.com>",
+    "CC: Troy <troy@escadia.com.au>",
+    "Subject: VPN",
+  ].join("\n");
+
+  it("fills the header To: even when the quoted body has its own To: line", () => {
+    const out = fillRecipientsFromDb(quotedReply, "richard@escadia.com.au; troy@escadia.com.au", "");
+    assert.match(out, /^To: richard@escadia\.com\.au; troy@escadia\.com\.au$/m);
+    // the quoted block below is left exactly as it was
+    assert.ok(out.includes("To: Tamm Sjodin <tamm@australiangeographic.com>"));
+  });
+
+  it("adds CC to the header, not next to the quoted CC further down", () => {
+    const out = fillRecipientsFromDb(quotedReply, "a@example.com", "b@example.com");
+    const lines = out.split("\n");
+    assert.equal(lines[2], "To: a@example.com");
+    assert.equal(lines[3], "CC: b@example.com");
+    assert.equal(lines[4], "Date: Tuesday, 25 August 2026 at 18:58:23");
+  });
+
+  it("returns text unchanged when there is no To: line at all", () => {
+    const noTo = "Subject: x\nFrom: y\n\nbody";
+    assert.equal(fillRecipientsFromDb(noTo, "a@example.com", "b@example.com"), noTo);
+  });
 });
 
 describe("markdownToHtml", () => {

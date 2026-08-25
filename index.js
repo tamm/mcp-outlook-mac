@@ -208,14 +208,21 @@ end tell`;
 // AppleScript sometimes yields empty `to recipients` / `cc recipients` (always on
 // Sent Items). Backfill those header lines from the Mail DB address-list columns.
 function fillRecipientsFromDb(text, dbTo, dbCc) {
-  let out = text;
-  if (dbTo && dbTo.trim() && !/^To: .+/m.test(out)) {
-    out = out.replace(/^To:.*$/m, `To: ${dbTo.trim()}`);
+  // Only ever look at, and touch, the FIRST To:/CC: lines — the real header block.
+  // A quoted reply below carries its own "To:"/"CC:" lines, and matching those made
+  // the fallback conclude the header was already populated and skip the fill.
+  const lines = text.split("\n");
+  const to = lines.findIndex(l => l.startsWith("To:"));
+  if (to === -1) return text;
+  if (dbTo && dbTo.trim() && !lines[to].slice(3).trim()) {
+    lines[to] = `To: ${dbTo.trim()}`;
   }
-  if (dbCc && dbCc.trim() && !/^CC: .+/m.test(out)) {
-    out = out.replace(/^(To:.*)$/m, `$1\nCC: ${dbCc.trim()}`);
+  if (dbCc && dbCc.trim()) {
+    const cc = lines[to + 1]?.startsWith("CC:") ? to + 1 : -1;
+    if (cc === -1) lines.splice(to + 1, 0, `CC: ${dbCc.trim()}`);
+    else if (!lines[cc].slice(3).trim()) lines[cc] = `CC: ${dbCc.trim()}`;
   }
-  return out;
+  return lines.join("\n");
 }
 
 
@@ -949,7 +956,9 @@ end tell`;
   // Outlook's AppleScript recipient lists come back empty for some messages —
   // reliably so on Sent Items — while the DB columns are always populated.
   let resultWithCc = result;
-  if (!/^To: .+/m.test(result) || !/^CC: .+/m.test(result)) {
+  const headerEnd = result.indexOf("\n\n");
+  const headerBlock = headerEnd === -1 ? result : result.slice(0, headerEnd);
+  if (!/^To: .+/m.test(headerBlock) || !/^CC: .+/m.test(headerBlock)) {
     try {
       const rows = runSqlite(
         `SELECT Message_ToRecipientAddressList, Message_CCRecipientAddressList
