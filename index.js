@@ -205,6 +205,20 @@ end tell`;
 
 // --- Message helpers ---
 
+// AppleScript sometimes yields empty `to recipients` / `cc recipients` (always on
+// Sent Items). Backfill those header lines from the Mail DB address-list columns.
+function fillRecipientsFromDb(text, dbTo, dbCc) {
+  let out = text;
+  if (dbTo && dbTo.trim() && !/^To: .+/m.test(out)) {
+    out = out.replace(/^To:.*$/m, `To: ${dbTo.trim()}`);
+  }
+  if (dbCc && dbCc.trim() && !/^CC: .+/m.test(out)) {
+    out = out.replace(/^(To:.*)$/m, `$1\nCC: ${dbCc.trim()}`);
+  }
+  return out;
+}
+
+
 function lookupEmailLocation(emailId) {
   try {
     const rows = runSqlite(
@@ -924,17 +938,21 @@ end tell`;
   const result = runAppleScriptHeredoc(script);
   if (result === "NOT_FOUND") return err(`Email ${emailId} not found.`);
 
-  // Supplement CC from DB if AppleScript returned none (Outlook UI/AS bug can hide CC)
+  // Supplement To/CC from the DB when AppleScript returned none.
+  // Outlook's AppleScript recipient lists come back empty for some messages —
+  // reliably so on Sent Items — while the DB columns are always populated.
   let resultWithCc = result;
-  if (!/^CC: .+/m.test(result)) {
+  if (!/^To: .+/m.test(result) || !/^CC: .+/m.test(result)) {
     try {
       const rows = runSqlite(
-        `SELECT Message_CCRecipientAddressList FROM Mail WHERE Record_RecordID = ${Number(emailId)} LIMIT 1`
+        `SELECT Message_ToRecipientAddressList, Message_CCRecipientAddressList
+         FROM Mail WHERE Record_RecordID = ${Number(emailId)} LIMIT 1`
       );
-      const dbCc = rows?.[0]?.Message_CCRecipientAddressList;
-      if (dbCc && dbCc.trim()) {
-        resultWithCc = result.replace(/^(To: .*)$/m, `$1\nCC: ${dbCc}`);
-      }
+      resultWithCc = fillRecipientsFromDb(
+        result,
+        rows?.[0]?.Message_ToRecipientAddressList,
+        rows?.[0]?.Message_CCRecipientAddressList
+      );
     } catch {}
   }
 
@@ -1461,6 +1479,7 @@ export {
   stripSignature,
   stripQuotedReplies,
   cleanBody,
+  fillRecipientsFromDb,
   markdownToHtml,
   coerceEmailIds,
   setRecipientsScript,

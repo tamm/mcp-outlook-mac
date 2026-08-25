@@ -10,6 +10,7 @@ import {
   stripSignature,
   stripQuotedReplies,
   cleanBody,
+  fillRecipientsFromDb,
   markdownToHtml,
   coerceEmailIds,
   setRecipientsScript,
@@ -223,6 +224,40 @@ describe("cleanBody", () => {
       "My reply\n-- \nJohn\n\nOn Mon, Jan 1, 2026 at 10:00 AM Someone wrote:\n> hi";
     const result = cleanBody(input);
     assert.equal(result, "My reply");
+  });
+});
+
+describe("fillRecipientsFromDb", () => {
+  const sent = [
+    "Subject: Invoice split",
+    "From: Tamm <tamm@australiangeographic.com>",
+    "To: ",
+    "Date: Wednesday, 20 May 2026 at 12:53:00",
+    "",
+    "body text",
+  ].join("\n");
+
+  it("fills an empty To: from the DB (Sent Items repro)", () => {
+    const out = fillRecipientsFromDb(sent, "sophie.hanson@junkeemedia.com", null);
+    assert.ok(out.includes("To: sophie.hanson@junkeemedia.com"));
+    assert.ok(out.includes("body text"));
+  });
+
+  it("does not overwrite a To: AppleScript already populated", () => {
+    const filled = sent.replace("To: ", "To: real@example.com, ");
+    const out = fillRecipientsFromDb(filled, "wrong@example.com", null);
+    assert.ok(out.includes("To: real@example.com"));
+    assert.ok(!out.includes("wrong@example.com"));
+  });
+
+  it("still adds CC below the To line", () => {
+    const out = fillRecipientsFromDb(sent, "a@example.com", "b@example.com");
+    assert.match(out, /^To: a@example\.com\nCC: b@example\.com$/m);
+  });
+
+  it("leaves text untouched when the DB has nothing", () => {
+    assert.equal(fillRecipientsFromDb(sent, null, undefined), sent);
+    assert.equal(fillRecipientsFromDb(sent, "  ", ""), sent);
   });
 });
 
