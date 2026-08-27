@@ -153,12 +153,16 @@ function cleanBody(text) {
 const SPACER = '<p style="margin:0">&nbsp;</p>';
 
 function emailParagraphs(html) {
-  const out = html.replace(/<p>([\s\S]*?)<\/p>/g, (whole, inner) =>
-    inner
-      .split(/<br\s*\/?>\s*/)
-      .map(line => `<p style="margin:0">${line}</p>`)
-      .join("") + SPACER
-  );
+  const out = html
+    .replace(/<p>([\s\S]*?)<\/p>/g, (whole, inner) =>
+      inner
+        .split(/<br\s*\/?>\s*/)
+        .map(line => `<p style="margin:0">${line}</p>`)
+        .join("") + SPACER
+    )
+    // a list or heading needs the same gap after it that a paragraph gets.
+    // the (?!\s*<\/) skips a nested list, whose close tag sits inside an <li>.
+    .replace(/<\/(ul|ol|h[1-6]|pre|blockquote|table)>(?!\s*<\/)/g, `$&${SPACER}`);
   // the trailing spacer after the final paragraph is just dead space
   return out.endsWith(SPACER + "\n") ? out.slice(0, -(SPACER.length + 1)) + "\n"
        : out.endsWith(SPACER) ? out.slice(0, -SPACER.length)

@@ -391,6 +391,26 @@ describe("emailParagraphs", () => {
   it("handles self-closing <br/>", () => {
     assert.ok(emailParagraphs("<p>a<br/>b</p>").includes('<p style="margin:0">b</p>'));
   });
+
+  it("puts a gap after a list, so it does not run into the next paragraph", () => {
+    const out = emailParagraphs("<ul>\n<li>one</li>\n</ul>\n<p>after</p>");
+    assert.ok(out.includes('</ul><p style="margin:0">&nbsp;</p>'));
+  });
+
+  it("puts a gap after a heading", () => {
+    const out = emailParagraphs("<h1>Title</h1>\n<p>after</p>");
+    assert.ok(out.includes('</h1><p style="margin:0">&nbsp;</p>'));
+  });
+
+  it("does not put a gap after a nested list closing inside an <li>", () => {
+    const out = emailParagraphs("<ul>\n<li>top<ul>\n<li>inner</li>\n</ul>\n</li>\n</ul>\n<p>after</p>");
+    assert.equal(out.match(/&nbsp;/g).length, 1, "only the outer list gets a gap");
+  });
+
+  it("leaves no dead gap when the body ends with a list", () => {
+    const html = "<ul>\n<li>one</li>\n</ul>";
+    assert.equal(emailParagraphs(html), html);
+  });
 });
 
 // The bug Tamm reported survived a correct <br> because textutil's HTML importer
