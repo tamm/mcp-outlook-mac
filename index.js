@@ -1099,6 +1099,33 @@ function setRecipientsScript(toAddrs, ccAddrs, msgVar) {
   return lines.join("\n    ");
 }
 
+// An open draft window keeps its own editor buffer.  Setting `content` on a
+// message that already has a window shows nothing and gets clobbered when the
+// window saves, so the body goes in first and the window opens afterwards.
+function openDraftWindow(composeId) {
+  return runAppleScriptHeredoc(`
+tell application "Microsoft Outlook"
+    activate
+    open (message id ${composeId})
+end tell`);
+}
+
+// Never report success we cannot see.  Pick the longest word in the body and
+// check it actually landed in the draft's content.
+function draftHasBody(composeId, body) {
+  const word = (body.match(/[A-Za-z0-9]{5,}/g) || []).sort((a, b) => b.length - a.length)[0];
+  if (!word) return true;
+  try {
+    const content = runAppleScriptHeredoc(`
+tell application "Microsoft Outlook"
+    return content of (message id ${composeId})
+end tell`);
+    return typeof content === "string" && content.includes(word);
+  } catch {
+    return false;
+  }
+}
+
 function composeReplyOrForward(args, mode, body, htmlBody) {
   const emailId = args?.email_id;
   if (!emailId) return err("email_id required for reply/forward.");
@@ -1134,16 +1161,15 @@ end tell`;
     }
   }
 
-  // Step 1: open the reply/forward window and capture the new message's id.
+  // Step 1: create the reply/forward with no window and capture its id.
   // Targeting by id avoids the `message of front window` race entirely —
   // Outlook has a number of visible=false phantom windows (Contact Suggestions
   // autocomplete popups, stale inspectors) that compete for "front window".
   const openScript = `
 tell application "Microsoft Outlook"
-    activate
 ${findMessageScript(emailId)}
     if targetMsg is missing value then return "NOT_FOUND"
-    set composeMsg to ${action} with opening window
+    set composeMsg to ${action} without opening window
     return (id of composeMsg) as string
 end tell`;
   const composeIdRaw = runAppleScriptHeredoc(openScript);
@@ -1160,6 +1186,7 @@ end tell`;
 
   if (body.trim()) {
     let tmpPath = null;
+    let injectError = null;
     try {
       const rtf = setRtfBody(htmlBody, "composeMsg");
       tmpPath = rtf.tmpPath;
@@ -1169,8 +1196,7 @@ tell application "Microsoft Outlook"
     ${rtf.snippet}${recipientFix}
 end tell`;
       const result = runAppleScriptHeredoc(injectScript);
-      if (result && result.startsWith("Error:")) return err(result.slice(7));
-      return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
+      if (result && result.startsWith("Error:")) injectError = result.slice(7);
     } catch (rtfErr) {
       // Outlook refuses «class RTF » on message objects here, so fall back to the
       // HTML content property — the same thing composeNew falls back to, and the
@@ -1188,11 +1214,19 @@ tell application "Microsoft Outlook"
     set content of composeMsg to ("${escapedHtml}" & content of composeMsg)${recipientFix}
 end tell`;
       const result = runAppleScriptHeredoc(fallbackScript);
-      if (result && result.startsWith("Error:")) return err(result.slice(7));
-      return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
+      if (result && result.startsWith("Error:")) injectError = result.slice(7);
     } finally {
       if (tmpPath) try { fs.unlinkSync(tmpPath); } catch {}
     }
+    if (injectError) return err(injectError);
+    openDraftWindow(composeId);
+    if (!draftHasBody(composeId, body)) {
+      return err(
+        `${mode === "reply" ? "Reply" : "Forward"} draft for email ${emailId} was created but the body did not land. ` +
+        `Give the user this text to paste by hand:\n\n${body}`
+      );
+    }
+    return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
   }
 
   // No body: just apply recipient overrides if any.
@@ -1204,6 +1238,7 @@ end tell`;
     const result = runAppleScriptHeredoc(fixScript);
     if (result && result.startsWith("Error:")) return err(result.slice(7));
   }
+  openDraftWindow(composeId);
   return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
 }
 
