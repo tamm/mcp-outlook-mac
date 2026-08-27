@@ -1135,7 +1135,9 @@ function handleCompose(args) {
   }
 
   if (mode === "reply" || mode === "forward") {
-    return composeReplyOrForward(args, mode, body, htmlBody, attachFiles);
+    return mode === "forward"
+      ? composeForward(args, body, htmlBody, attachFiles)
+      : composeReplyOrForward(args, mode, body, htmlBody, attachFiles);
   }
 
   return err(`Invalid mode: ${mode}. Use "new", "reply", or "forward".`);
@@ -1332,6 +1334,42 @@ end tell`;
     if (result && result.startsWith("Error:")) return err(result.slice(7));
   }
   return finish();
+}
+
+// Outlook renders a compose window ONCE, when it opens.  Anything written to
+// the message afterwards updates the object but never appears on screen — the
+// dictionary has no refresh of any kind.  A reply survives that because its
+// body arrives as a clipboard paste into the caret, which a reply window puts
+// in the body.  A forward window puts the caret in To:, so the same paste goes
+// nowhere.  So a forward is built first and opened last, exactly as
+// composeNew does.
+function composeForward(args, body, htmlBody, attachFiles = []) {
+  const emailId = args?.email_id;
+  if (!emailId) return err("email_id required for reply/forward.");
+
+  const toAddrs = parseRecipients(args?.to);
+  const ccAddrs = parseRecipients(args?.cc);
+
+  // Prepending keeps the quoted original that `forward` has already put there.
+  const bodyLine = body.trim()
+    ? `\n    set content of fwdMsg to ("${escapeForAppleScript(htmlBody)}" & content of fwdMsg)`
+    : "";
+  const toLines = toAddrs.length ? `\n    ${recipientLines(toAddrs, "to", "fwdMsg")}` : "";
+  const ccLines = ccAddrs.length ? `\n    ${recipientLines(ccAddrs, "cc", "fwdMsg")}` : "";
+  const attachLines = attachFiles.length ? `\n    ${attachmentLines(attachFiles, "fwdMsg")}` : "";
+
+  const script = `
+tell application "Microsoft Outlook"
+${findMessageScript(emailId)}
+    if targetMsg is missing value then return "NOT_FOUND"
+    set fwdMsg to forward targetMsg without opening window${bodyLine}${toLines}${ccLines}${attachLines}
+    open fwdMsg
+    activate
+end tell`;
+  const result = runAppleScriptHeredoc(script);
+  if (result === "NOT_FOUND") return err(`Email ${emailId} not found.`);
+  if (result && result.startsWith("Error:")) return err(result.slice(7));
+  return ok(`Forward draft created for email ${emailId}.`);
 }
 
 // --- Handler: move_email ---
