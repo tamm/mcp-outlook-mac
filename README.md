@@ -56,7 +56,7 @@ See `SPEC.md` for the full list and semantics. Quick summary:
 | `list_folders` | All mail folders with counts |
 | `search_emails` | The one search tool — subject, sender, recipients (To/CC) and body across ALL folders incl. Sent. Trigram substring + fuzzy, exact ranked first, multi-word decomposed. Just pass a query. |
 | `get_email` | Full content by ID (strips signatures and quotes by default) |
-| `compose` | Draft new / reply / forward — body is markdown |
+| `compose` | Draft new / reply / forward — body is markdown, optional file attachments |
 | `move_email` | Move to any folder |
 | `archive_emails` | Batch archive (move to Archive) |
 | `download_attachment` | Save attachment(s) to disk |
@@ -80,6 +80,20 @@ test/           — node --test suite
 3. `npm test` must be green.
 4. Keep `SPEC.md` in sync with tool changes.
 5. Commit — the pre-commit hook re-runs tests.
+
+## Attachments
+
+`compose` takes an optional `attachments` argument — a file path or an array of paths — in every mode
+(new, reply, forward):
+
+```json
+{ "mode": "new", "to": "someone@example.com", "subject": "Report",
+  "body": "See attached.", "attachments": ["~/Documents/report.pdf"] }
+```
+
+Paths may be absolute, relative, or `~`-prefixed. Each is checked before Outlook is touched: it must exist,
+be a readable regular file (not a directory), and be at most 25 MB — with 25 MB the cap for the whole set.
+Any bad path fails the whole call and no draft is created. See `SPEC.md` for details.
 
 ## Known limitations
 

@@ -340,6 +340,97 @@ function recipientLines(addresses, type, msgVar) {
   ).join("\n    ");
 }
 
+// --- Attachments ---
+
+// Per-file and total size cap. 25 MB is the Exchange Online default message
+// limit; anything over that would be rejected on send anyway.
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+// Accepts a single path, an array of paths, or a JSON-stringified array
+// (some MCP clients stringify array-typed args on the wire).
+// Deliberately does NOT split on commas — commas are legal in filenames.
+function parseAttachments(input) {
+  if (input == null || input === "") return [];
+  if (Array.isArray(input)) return input.map(p => String(p).trim()).filter(Boolean);
+  if (typeof input !== "string") return [];
+  const trimmed = input.trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return parsed.map(p => String(p).trim()).filter(Boolean);
+    } catch {}
+  }
+  return [trimmed];
+}
+
+// Expand a leading ~ and make the path absolute.
+function resolveAttachmentPath(p) {
+  let s = String(p).trim();
+  if (s === "~") s = os.homedir();
+  else if (s.startsWith("~/")) s = path.join(os.homedir(), s.slice(2));
+  return path.resolve(s);
+}
+
+// Trust boundary: every path from the caller is resolved and checked here
+// before it reaches AppleScript. Returns resolved files plus human-readable
+// errors; the caller refuses the whole compose if `errors` is non-empty.
+function validateAttachments(input) {
+  const files = [];
+  const errors = [];
+  let total = 0;
+
+  for (const raw of parseAttachments(input)) {
+    const resolved = resolveAttachmentPath(raw);
+    let st;
+    try {
+      st = fs.statSync(resolved);
+    } catch {
+      errors.push(`Attachment not found: ${resolved}`);
+      continue;
+    }
+    if (st.isDirectory()) {
+      errors.push(`Attachment is a directory, not a file: ${resolved}`);
+      continue;
+    }
+    if (!st.isFile()) {
+      errors.push(`Attachment is not a regular file: ${resolved}`);
+      continue;
+    }
+    try {
+      fs.accessSync(resolved, fs.constants.R_OK);
+    } catch {
+      errors.push(`Attachment is not readable: ${resolved}`);
+      continue;
+    }
+    if (st.size > MAX_ATTACHMENT_BYTES) {
+      errors.push(`Attachment too large (${mb(st.size)} MB, cap ${mb(MAX_ATTACHMENT_BYTES)} MB): ${resolved}`);
+      continue;
+    }
+    if (files.includes(resolved)) continue; // same file twice — attach once
+    total += st.size;
+    files.push(resolved);
+  }
+
+  if (total > MAX_ATTACHMENT_BYTES) {
+    errors.push(`Attachments total ${mb(total)} MB, over the ${mb(MAX_ATTACHMENT_BYTES)} MB cap.`);
+  }
+  return { files, errors };
+}
+
+function mb(bytes) {
+  return (bytes / (1024 * 1024)).toFixed(1);
+}
+
+// Mirrors recipientLines: one `make new attachment` per file.
+// Proven syntax (Outlook sdef: attachment `file` property is writable only when
+// making a new attachment): make new attachment at <msg> with properties {file:POSIX file "..."}
+function attachmentLines(files, msgVar) {
+  return files.map(f =>
+    `make new attachment at ${msgVar} with properties {file:POSIX file "${escapeForAppleScript(f)}"}`
+  ).join("\n    ");
+}
+
 // --- Query helpers ---
 
 // Split a multi-word query into individual terms (strips punctuation, dedupes, ignores short words)
@@ -632,7 +723,7 @@ const TOOLS = [
   },
   {
     name: "compose",
-    description: "Draft new email, reply, or forward. Body is markdown.",
+    description: "Draft new email, reply, or forward. Body is markdown. Optional attachments by file path.",
     inputSchema: {
       type: "object",
       properties: {
@@ -643,6 +734,10 @@ const TOOLS = [
         cc: { oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }], description: "CC recipient(s). String, comma-separated string, or array." },
         email_id: { type: "number", description: "Email ID (reply/forward)." },
         reply_all: { type: "boolean", description: "Reply all." },
+        attachments: {
+          oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }],
+          description: "File path(s) to attach. One path or an array of paths. Absolute or ~-relative; must exist and be readable, max 25 MB per file and in total. Works in all modes (new/reply/forward).",
+        },
       },
       required: ["mode", "body"],
     },
@@ -1030,21 +1125,29 @@ function handleCompose(args) {
   const body = args?.body || "";
   const htmlBody = markdownToHtml(body);
 
+  // Validate attachments before touching Outlook — a bad path must not create
+  // a half-populated draft.
+  const { files: attachFiles, errors: attachErrors } = validateAttachments(args?.attachments);
+  if (attachErrors.length) return err(attachErrors.join("\n"));
+
   if (mode === "new") {
-    return composeNew(args, body, htmlBody);
+    return composeNew(args, body, htmlBody, attachFiles);
   }
 
   if (mode === "reply" || mode === "forward") {
-    return composeReplyOrForward(args, mode, body, htmlBody);
+    return composeReplyOrForward(args, mode, body, htmlBody, attachFiles);
   }
 
   return err(`Invalid mode: ${mode}. Use "new", "reply", or "forward".`);
 }
 
-function composeNew(args, body, htmlBody) {
+function composeNew(args, body, htmlBody, attachFiles = []) {
   const subject = args?.subject || "";
   const toAddrs = parseRecipients(args?.to);
   const ccAddrs = parseRecipients(args?.cc);
+  const attachNote = attachFiles.length
+    ? ` (${attachFiles.length} attachment${attachFiles.length === 1 ? "" : "s"})`
+    : "";
 
   // Try RTF injection first
   if (body.trim()) {
@@ -1056,10 +1159,11 @@ function composeNew(args, body, htmlBody) {
     set newMsg to make new outgoing message with properties {subject:"${escapeForAppleScript(subject)}"}`;
       if (toAddrs.length) script += `\n    ${recipientLines(toAddrs, "to", "newMsg")}`;
       if (ccAddrs.length) script += `\n    ${recipientLines(ccAddrs, "cc", "newMsg")}`;
+      if (attachFiles.length) script += `\n    ${attachmentLines(attachFiles, "newMsg")}`;
       script += `\n    ${rtf.snippet}`;
       script += `\n    open newMsg\n    activate\nend tell`;
       runAppleScriptHeredoc(script);
-      return ok(`Draft created: ${subject}`);
+      return ok(`Draft created: ${subject}${attachNote}`);
     } catch (rtfErr) {
       // RTF injection failed — fall back to HTML content property
       console.error(`RTF injection failed, falling back to HTML: ${rtfErr.message}`);
@@ -1074,9 +1178,10 @@ function composeNew(args, body, htmlBody) {
     set newMsg to make new outgoing message with properties {subject:"${escapeForAppleScript(subject)}", content:"${escapedBody}"}`;
   if (toAddrs.length) script += `\n    ${recipientLines(toAddrs, "to", "newMsg")}`;
   if (ccAddrs.length) script += `\n    ${recipientLines(ccAddrs, "cc", "newMsg")}`;
+  if (attachFiles.length) script += `\n    ${attachmentLines(attachFiles, "newMsg")}`;
   script += `\n    open newMsg\n    activate\nend tell`;
   runAppleScriptHeredoc(script);
-  return ok(`Draft created: ${subject}`);
+  return ok(`Draft created: ${subject}${attachNote}`);
 }
 
 // Build an AppleScript snippet that wipes and rebuilds recipient lists.
@@ -1103,7 +1208,7 @@ function setRecipientsScript(toAddrs, ccAddrs, msgVar) {
   return lines.join("\n    ");
 }
 
-function composeReplyOrForward(args, mode, body, htmlBody) {
+function composeReplyOrForward(args, mode, body, htmlBody, attachFiles = []) {
   const emailId = args?.email_id;
   if (!emailId) return err("email_id required for reply/forward.");
   const replyAll = args?.reply_all || false;
@@ -1127,7 +1232,9 @@ end tell`;
   // Provided field wipes and rebuilds that field only; the other is left untouched
   // so native reply/reply-all population is preserved for the unspecified side.
   let recipientOverride = null;
-  if (mode === "reply") {
+  // A forward starts with no recipients at all, so it needs `to` just as much
+  // as a reply does.  Recipients only — the body path is untouched.
+  {
     const hasTo = args?.to != null;
     const hasCc = args?.cc != null;
     if (hasTo || hasCc) {
@@ -1157,6 +1264,30 @@ end tell`;
     return err(`Failed to open ${mode} window for email ${emailId}: got ${composeIdRaw}`);
   }
 
+  // Attachments run as their own osascript call, after all body work is done,
+  // so nothing here can disturb the body delivery path or window ordering.
+  const finish = () => {
+    const label = mode === "reply" ? "Reply" : "Forward";
+    if (attachFiles.length) {
+      const attachScript = `
+tell application "Microsoft Outlook"
+    set composeMsg to message id ${composeId}
+    ${attachmentLines(attachFiles, "composeMsg")}
+end tell`;
+      try {
+        const r = runAppleScriptHeredoc(attachScript);
+        if (r && r.startsWith("Error:")) {
+          return err(`${label} draft created for email ${emailId}, but attaching failed: ${r.slice(7)}`);
+        }
+      } catch (e) {
+        return err(`${label} draft created for email ${emailId}, but attaching failed: ${e.message}`);
+      }
+      const n = attachFiles.length;
+      return ok(`${label} draft created for email ${emailId}. (${n} attachment${n === 1 ? "" : "s"})`);
+    }
+    return ok(`${label} draft created for email ${emailId}.`);
+  };
+
   // Step 2: inject body + recipient overrides by targeting the draft by id.
   const recipientFix = recipientOverride
     ? `\n    ${setRecipientsScript(recipientOverride.to, recipientOverride.cc, "composeMsg")}`
@@ -1174,7 +1305,7 @@ tell application "Microsoft Outlook"
 end tell`;
       const result = runAppleScriptHeredoc(injectScript);
       if (result && result.startsWith("Error:")) return err(result.slice(7));
-      return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
+      return finish();
     } catch (rtfErr) {
       console.error(`[compose] RTF injection failed for draft ${composeId}, falling back to clipboard paste: ${rtfErr.message}`);
       pasteViaClipboard(htmlBody);
@@ -1185,7 +1316,7 @@ end tell
 ${pasteIntoFrontWindow()}`;
       const result = runAppleScriptHeredoc(fallbackScript);
       if (result && result.startsWith("Error:")) return err(result.slice(7));
-      return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
+      return finish();
     } finally {
       if (tmpPath) try { fs.unlinkSync(tmpPath); } catch {}
     }
@@ -1200,7 +1331,7 @@ end tell`;
     const result = runAppleScriptHeredoc(fixScript);
     if (result && result.startsWith("Error:")) return err(result.slice(7));
   }
-  return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
+  return finish();
 }
 
 // --- Handler: move_email ---
@@ -1520,6 +1651,10 @@ export {
   extractEmail,
   parseRecipients,
   recipientLines,
+  parseAttachments,
+  validateAttachments,
+  attachmentLines,
+  MAX_ATTACHMENT_BYTES,
   escapeForAppleScript,
   stripSignature,
   stripQuotedReplies,

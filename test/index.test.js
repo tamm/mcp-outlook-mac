@@ -8,6 +8,10 @@ import {
   extractEmail,
   parseRecipients,
   recipientLines,
+  parseAttachments,
+  validateAttachments,
+  attachmentLines,
+  MAX_ATTACHMENT_BYTES,
   escapeForAppleScript,
   stripSignature,
   stripQuotedReplies,
@@ -750,5 +754,188 @@ describe("parseRecipients — edge cases", () => {
     assert.ok(result.includes("a@example.com"));
     assert.ok(result.includes("b@example.com"));
     assert.ok(result.includes("c@example.com"));
+  });
+});
+
+describe("parseAttachments", () => {
+  it("returns [] for null, undefined and empty string", () => {
+    assert.deepEqual(parseAttachments(null), []);
+    assert.deepEqual(parseAttachments(undefined), []);
+    assert.deepEqual(parseAttachments(""), []);
+    assert.deepEqual(parseAttachments("   "), []);
+  });
+
+  it("wraps a single path in an array", () => {
+    assert.deepEqual(parseAttachments("/tmp/a.pdf"), ["/tmp/a.pdf"]);
+  });
+
+  it("keeps an array as-is, trimmed and compacted", () => {
+    assert.deepEqual(
+      parseAttachments(["/tmp/a.pdf", "  /tmp/b.pdf  ", ""]),
+      ["/tmp/a.pdf", "/tmp/b.pdf"]
+    );
+  });
+
+  it("parses a JSON-stringified array (clients that stringify args)", () => {
+    assert.deepEqual(
+      parseAttachments('["/tmp/a.pdf","/tmp/b.pdf"]'),
+      ["/tmp/a.pdf", "/tmp/b.pdf"]
+    );
+  });
+
+  it("does NOT split on commas — commas are legal in filenames", () => {
+    assert.deepEqual(
+      parseAttachments("/tmp/Smith, John - invoice.pdf"),
+      ["/tmp/Smith, John - invoice.pdf"]
+    );
+  });
+});
+
+describe("validateAttachments", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-att-test-"));
+  const good = path.join(tmpDir, "good.txt");
+  fs.writeFileSync(good, "hello");
+  const second = path.join(tmpDir, "second.txt");
+  fs.writeFileSync(second, "world");
+
+  it("accepts an existing readable file", () => {
+    const { files, errors } = validateAttachments(good);
+    assert.deepEqual(errors, []);
+    assert.deepEqual(files, [good]);
+  });
+
+  it("accepts several files", () => {
+    const { files, errors } = validateAttachments([good, second]);
+    assert.deepEqual(errors, []);
+    assert.equal(files.length, 2);
+  });
+
+  it("de-duplicates the same file passed twice", () => {
+    const { files, errors } = validateAttachments([good, good]);
+    assert.deepEqual(errors, []);
+    assert.deepEqual(files, [good]);
+  });
+
+  it("resolves a relative path to an absolute one", () => {
+    const rel = path.relative(process.cwd(), good);
+    const { files, errors } = validateAttachments(rel);
+    assert.deepEqual(errors, []);
+    assert.deepEqual(files, [good]);
+  });
+
+  it("expands a leading ~ to the home directory", () => {
+    const homeFile = path.join(os.homedir(), `.mcp-att-test-${process.pid}.txt`);
+    fs.writeFileSync(homeFile, "x");
+    try {
+      const { files, errors } = validateAttachments(`~/${path.basename(homeFile)}`);
+      assert.deepEqual(errors, []);
+      assert.deepEqual(files, [homeFile]);
+    } finally {
+      fs.unlinkSync(homeFile);
+    }
+  });
+
+  it("rejects a missing file", () => {
+    const { files, errors } = validateAttachments(path.join(tmpDir, "nope.txt"));
+    assert.deepEqual(files, []);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /not found/i);
+  });
+
+  it("rejects a directory", () => {
+    const { files, errors } = validateAttachments(tmpDir);
+    assert.deepEqual(files, []);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /directory/i);
+  });
+
+  it("rejects an unreadable file", () => {
+    const locked = path.join(tmpDir, "locked.txt");
+    fs.writeFileSync(locked, "secret");
+    fs.chmodSync(locked, 0o000);
+    try {
+      const { files, errors } = validateAttachments(locked);
+      if (files.length) return; // running as root: permissions do not apply
+      assert.equal(errors.length, 1);
+      assert.match(errors[0], /not readable/i);
+    } finally {
+      fs.chmodSync(locked, 0o600);
+      fs.unlinkSync(locked);
+    }
+  });
+
+  it("rejects a file over the size cap", () => {
+    const big = path.join(tmpDir, "big.bin");
+    const fd = fs.openSync(big, "w");
+    fs.ftruncateSync(fd, MAX_ATTACHMENT_BYTES + 1);
+    fs.closeSync(fd);
+    try {
+      const { files, errors } = validateAttachments(big);
+      assert.deepEqual(files, []);
+      assert.equal(errors.length, 1);
+      assert.match(errors[0], /too large/i);
+    } finally {
+      fs.unlinkSync(big);
+    }
+  });
+
+  it("rejects a set of files whose total is over the cap", () => {
+    const half = Math.floor(MAX_ATTACHMENT_BYTES * 0.6);
+    const paths = ["t1.bin", "t2.bin"].map(n => path.join(tmpDir, n));
+    for (const p of paths) {
+      const fd = fs.openSync(p, "w");
+      fs.ftruncateSync(fd, half);
+      fs.closeSync(fd);
+    }
+    try {
+      const { errors } = validateAttachments(paths);
+      assert.ok(errors.some(e => /total/i.test(e)), `Expected a total-size error, got: ${errors.join("; ")}`);
+    } finally {
+      for (const p of paths) fs.unlinkSync(p);
+    }
+  });
+
+  it("reports every bad path, not just the first", () => {
+    const { files, errors } = validateAttachments([
+      path.join(tmpDir, "missing1.txt"),
+      good,
+      path.join(tmpDir, "missing2.txt"),
+    ]);
+    assert.deepEqual(files, [good]);
+    assert.equal(errors.length, 2);
+  });
+
+  it("returns nothing to do when no attachments are given", () => {
+    const { files, errors } = validateAttachments(undefined);
+    assert.deepEqual(files, []);
+    assert.deepEqual(errors, []);
+  });
+});
+
+describe("attachmentLines", () => {
+  it("emits one make-new-attachment statement per file", () => {
+    const script = attachmentLines(["/tmp/a.pdf", "/tmp/b.pdf"], "newMsg");
+    const lines = script.split("\n").map(l => l.trim());
+    assert.equal(lines.length, 2);
+    assert.equal(
+      lines[0],
+      'make new attachment at newMsg with properties {file:POSIX file "/tmp/a.pdf"}'
+    );
+    assert.ok(lines[1].includes('"/tmp/b.pdf"'));
+  });
+
+  it("targets the message variable it is given", () => {
+    const script = attachmentLines(["/tmp/a.pdf"], "composeMsg");
+    assert.ok(script.includes("at composeMsg with properties"));
+  });
+
+  it("escapes quotes and backslashes in the path", () => {
+    const script = attachmentLines(['/tmp/we"ird\\name.pdf'], "newMsg");
+    assert.ok(script.includes('\\"ird'), script);
+    assert.ok(!script.includes('e"ird'), script);
+  });
+
+  it("returns an empty string for no files", () => {
+    assert.equal(attachmentLines([], "newMsg"), "");
   });
 });

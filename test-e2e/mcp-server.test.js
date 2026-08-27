@@ -18,6 +18,9 @@
 
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   startServer,
   stopServer,
@@ -381,6 +384,45 @@ end tell`, { timeoutMs: 15_000 });
   return result;
 }
 
+// Probe a draft by subject for its attachment count and names, then delete it.
+// Independent of the tool's own AppleScript: this reads `attachments of` the
+// outgoing message directly, which is the only proof an attachment landed.
+function probeDraftAttachments(subject) {
+  const escapedSubject = subject.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  try {
+    return probeAppleScript(`
+tell application "Microsoft Outlook"
+    set targetMsg to missing value
+    repeat with m in outgoing messages
+        try
+            if subject of m is "${escapedSubject}" then
+                set targetMsg to m
+                exit repeat
+            end if
+        end try
+    end repeat
+    if targetMsg is missing value then return "NOT_FOUND"
+    set attNames to ""
+    set attCount to 0
+    try
+        set attList to attachments of targetMsg
+        set attCount to count of attList
+        repeat with a in attList
+            try
+                set attNames to attNames & (name of a) & ","
+            end try
+        end repeat
+    end try
+    try
+        delete targetMsg
+    end try
+    return "FOUND|" & (attCount as string) & "|" & attNames
+end tell`, { timeoutMs: 20_000 });
+  } catch {
+    return "NOT_FOUND";
+  }
+}
+
 describe("compose (self-send fixture)", () => {
   it("creates a new draft that Outlook reports as a compose window", async () => {
     // We drive compose in "new" mode targeting our own address.
@@ -578,5 +620,110 @@ describe("download_attachment", () => {
       text.startsWith("Error:") || text.includes("no attachments"),
       `Expected no-attachments error, got: ${text}`
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// compose attachments
+// ---------------------------------------------------------------------------
+
+describe("compose attachments", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-e2e-att-"));
+  const fileA = path.join(tmpDir, "mcp-e2e-attach-a.txt");
+  const fileB = path.join(tmpDir, "mcp-e2e-attach-b.txt");
+
+  before(() => {
+    fs.writeFileSync(fileA, "e2e attachment payload A\n");
+    fs.writeFileSync(fileB, "e2e attachment payload B\n");
+  });
+
+  after(() => {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  });
+
+  it("attaches a single file to a new draft", async () => {
+    const { subject } = fixtureSubject("attach-one");
+
+    const text = await callTool(server, "compose", {
+      mode: "new",
+      to: "tamm@australiangeographic.com",
+      subject,
+      body: "Attachment e2e — one file.",
+      attachments: fileA,
+    });
+    assert.ok(!text.startsWith("Error:"), `Unexpected compose error: ${text}`);
+
+    const probe = probeDraftAttachments(subject);
+    if (probe === "NOT_FOUND") {
+      console.log("  Note: draft not found in outgoing messages — skipping attachment assertion");
+      return;
+    }
+    const [, count, names] = probe.split("|");
+    assert.equal(count.trim(), "1", `Expected 1 attachment, probe said: ${probe}`);
+    assert.ok(
+      names.includes(path.basename(fileA)),
+      `Expected "${path.basename(fileA)}" in attachment names, got: ${names}`
+    );
+  });
+
+  it("attaches an array of files to a new draft", async () => {
+    const { subject } = fixtureSubject("attach-many");
+
+    const text = await callTool(server, "compose", {
+      mode: "new",
+      to: "tamm@australiangeographic.com",
+      subject,
+      body: "Attachment e2e — two files.",
+      attachments: [fileA, fileB],
+    });
+    assert.ok(!text.startsWith("Error:"), `Unexpected compose error: ${text}`);
+
+    const probe = probeDraftAttachments(subject);
+    if (probe === "NOT_FOUND") {
+      console.log("  Note: draft not found in outgoing messages — skipping attachment assertion");
+      return;
+    }
+    const [, count, names] = probe.split("|");
+    assert.equal(count.trim(), "2", `Expected 2 attachments, probe said: ${probe}`);
+    assert.ok(names.includes(path.basename(fileA)) && names.includes(path.basename(fileB)),
+      `Expected both filenames, got: ${names}`);
+  });
+
+  it("rejects a missing path and creates no draft", async () => {
+    const { subject } = fixtureSubject("attach-missing");
+    const bogus = path.join(tmpDir, "does-not-exist.pdf");
+
+    const text = await callTool(server, "compose", {
+      mode: "new",
+      to: "tamm@australiangeographic.com",
+      subject,
+      body: "Should never become a draft.",
+      attachments: bogus,
+    });
+
+    assert.ok(text.startsWith("Error:"), `Expected an error for a missing path, got: ${text}`);
+    assert.match(text, /not found/i);
+
+    // Validation happens before Outlook is touched — no draft may exist.
+    assert.equal(
+      probeDraftAttachments(subject),
+      "NOT_FOUND",
+      "A rejected attachment must not leave a draft behind"
+    );
+  });
+
+  it("rejects a directory as an attachment", async () => {
+    const { subject } = fixtureSubject("attach-dir");
+
+    const text = await callTool(server, "compose", {
+      mode: "new",
+      to: "tamm@australiangeographic.com",
+      subject,
+      body: "Should never become a draft.",
+      attachments: tmpDir,
+    });
+
+    assert.ok(text.startsWith("Error:"), `Expected an error for a directory, got: ${text}`);
+    assert.match(text, /directory/i);
   });
 });

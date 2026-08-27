@@ -17,7 +17,7 @@ To fix: **Help > Revert to Legacy Outlook**. Once reverted, all tools work.
 | `list_folders` | Lists all folders with message counts |
 | `search_emails` | **The one search tool.** Searches subject, sender, recipients (To/CC) and body across ALL folders incl. Sent, by default. Trigram substring + fuzzy matching, exact matches ranked first. Multi-word queries decomposed and ranked by parts matched. Just pass a query. |
 | `get_email` | Full email content by ID. Strips signatures and quoted replies by default; pass `include_quoted: true` to keep them. Shows read/flagged status |
-| `compose` | Draft new email, reply, or forward. Body is markdown |
+| `compose` | Draft new email, reply, or forward. Body is markdown. Optional `attachments` (file path or array of paths) |
 | `move_email` | Move email to a folder (e.g. Archive) |
 | `archive_emails` | Batch archive — moves multiple emails to Archive |
 | `download_attachment` | Save attachment(s) to disk |
@@ -95,6 +95,33 @@ breaks do not. The last line of a run keeps the default paragraph spacing, so bl
 their gap while single newlines stay tight.
 
 The `compose` tool uses `textutil` to convert markdown→HTML→RTF, then injects the RTF directly into the message via `read POSIX file ... as «class RTF »`. This avoids clipboard hijacking.
+
+### Attachments
+
+`compose` takes an optional `attachments` argument in **all three modes** (new, reply, forward): one file path,
+or an array of paths. Paths may be absolute, relative to the server's cwd, or `~`-prefixed.
+
+Validation happens at the trust boundary in `handleCompose`, before Outlook is touched — a bad path can never
+leave a half-populated draft. `validateAttachments` resolves each path, then rejects: missing files, directories,
+non-regular files, unreadable files, any single file over 25 MB, and any set whose total exceeds 25 MB
+(`MAX_ATTACHMENT_BYTES` — the Exchange Online default message limit). Every bad path is reported, not just the
+first. Duplicate paths are attached once.
+
+`parseAttachments` accepts a string, an array, or a JSON-stringified array (some MCP clients stringify
+array-typed args). It deliberately does **not** split on commas — commas are legal in filenames.
+
+`attachmentLines` mirrors `recipientLines` and emits the syntax from Outlook's scripting dictionary
+(the attachment `file` property is writable only when making a new attachment):
+
+```applescript
+make new attachment at newMsg with properties {file:POSIX file "/path/to/file.pdf"}
+```
+
+- **new** — attachment statements are added to the same script that creates the draft, in both the RTF path
+  and the HTML fallback.
+- **reply / forward** — attachments run as a **separate** `osascript` call after all body work is finished,
+  targeting the draft by `message id`. This keeps them clear of the body delivery path and window ordering.
+  If attaching fails there, the response says the draft was created but attaching failed.
 
 ### Reply and reply-all recipient handling
 
